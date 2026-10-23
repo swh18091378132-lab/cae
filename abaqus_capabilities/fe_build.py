@@ -5,12 +5,15 @@ fe_build.py -- 生成 Abaqus 输入文件 (.inp)：铺层(CAE 属性) + 载荷 +
 原则（ADR-0005）：复合材料铺层作为 **FE 截面/layup 属性**定义，不进入 CATIA 几何。
 ADR-0010：网格已按自然格划分，每个单元唯一归属一个自然格；单元集合按自然格分组。
 
-**本文件将在 Abaqus 内置 Python 2.6.2 中执行**：
-  - 禁止 f-string / dict 推导 / set 推导 / yield from / 非 local / 变量注解
+**本文件将在 Abaqus 内置 Python 2.7.15 中执行**（ADR-0012 实测版本）：
+  - 禁止 f-string / yield from / nonlocal / 变量与参数注解 / 解包扩展
   - 只用 % 或 .format() 做字符串格式化
   - 通过 abaqus_capabilities/compat_check.py 静态检查
 
 坐标系：参数空间 y(展向) / xi(弦向 0..1)。这里把 xi 线性映射到物理弦向坐标 X。
+
+票14：分析类型只影响**分析步块**与**接触/材料非线性定义**（见文件末尾），
+网格 / 材料 / 铺层 / 载荷 / 边界完全复用，结果抽取口径也不变（ADR-0006）。
 """
 
 import math
@@ -80,6 +83,10 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
                  **部件族无关**：翼面族的 y=展向、筒段族的 y=轴向，xi 一律乘
                  xi_scale 换成物理长度。None 时回退到 P1 的 span/c_root 口径。
     analysis   : 分析类型声明（票14）；None 则按 step 决定分析步。
+                 声明里被消费的键：kind / step_name / n_modes / time_period /
+                 mass_scaling / n_field_outputs / element_type / nlgeom /
+                 nonlinearity / damage / contacts / max_increments / initial_increment。
+                 **分析类型清单与默认值只在 core/analysis.py 定义**，这里不复制。
 
     坐标系：参数空间 y(纵向) / xi(横向 0..1)。xi 经 xi_scale 线性映射到物理 X，
     y 直接用物理值作 Y。这样翼面类（展向×弦向）与筒段类（轴向×周向展开）
@@ -116,8 +123,9 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
         y = float(n["y"])
         add("%d, %s, %s, 0." % (n["id"], _fmt(x), _fmt(y)))
 
-    # ---- 单元（S4R 壳，复合材料常用） ----
-    add("*ELEMENT, TYPE=S4R, ELSET=ALL")
+    # ---- 单元（壳族；Explicit 可用 S4R 之外的显式壳，见 analysis.element_type） ----
+    etype = _element_type(analysis)
+    add("*ELEMENT, TYPE=%s, ELSET=ALL" % etype)
     for e in mesh_dict["elems"]:
         n = e["nodes"]
         add("%d, %d, %d, %d, %d" % (e["id"], n[0], n[1], n[2], n[3]))
@@ -142,6 +150,10 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
     add("*DENSITY")
     add("%s," % _fmt(material.get("rho", 1600.0)))
 
+    # ---- 材料非线性（票14）：复合材料 Hashin 损伤起始，写在 *MATERIAL 之后 ----
+    for ln in _damage_block(analysis):
+        add(ln)
+
     # ---- 复合材料壳截面（铺层 = CAE 属性，ADR-0005） ----
     add("*SHELL SECTION, ELSET=ALL, COMPOSITE, OFFSET=0.")
     for p in laminate["plies"]:
@@ -153,9 +165,11 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
         add(ln)
 
     # ---- 分析步 ----
-    # analysis（票14）优先于 step：不同分析类型在 Abaqus 侧是完全不同的分析步写法。
+    # analysis（票14）优先于 step：不同分析类型在 Abaqus 侧是完全不同的分析步写法,
+    # 分析步名也随类型走（Explicit-1 / Frequency-1 ...），便于 ODB 里按类型辨认。
     stype, step_block = _step_block(step, analysis, model_dict)
-    add("*STEP, NAME=%s" % step.get("name", "Step-1"))
+    add("*STEP, NAME=%s%s" % (_step_name(step, analysis),
+                              _step_params(analysis)))
     for ln in step_block:
         add(ln)
 
@@ -183,7 +197,12 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
             for nid in tip_nodes:
                 add("%d, 3, %s" % (nid, _fmt(mag / float(len(tip_nodes)))))
 
-    add("*OUTPUT, FIELD")
+    # ---- 输出请求：显式动力学要指定场输出间隔，其余保持 P1 口径 ----
+    n_intervals = int((analysis or {}).get("n_field_outputs", 0) or 0)
+    if n_intervals > 0:
+        add("*OUTPUT, FIELD, NUMBER INTERVAL=%d" % n_intervals)
+    else:
+        add("*OUTPUT, FIELD")
     add("*ELEMENT OUTPUT")
     add("S, E")
     add("*NODE OUTPUT")
@@ -212,35 +231,86 @@ def _safe(name):
 # 设计：分析类型只影响**分析步块**与**接触/非线性定义**；网格、材料、铺层、
 # 载荷/边界完全复用。分析类型也不改变结果抽取格式（ADR-0006）——
 # extract.py 对每种类型都吐同一套 element×ply×field CSV。
+#
 # 本文件在 Abaqus 内置 Python 2.7 执行，故只用 2.7 语法。
+# **分析类型的清单与默认值只在 core/analysis.py 定义**（宿主侧唯一权威），
+# 这里只消费传进来的声明 dict，不复制一份"影子定义"以免两处漂移。
+#
+# Abaqus 关键字要点（票14 修正，此前实现有 4 处会产生非法 .inp）：
+#   * `*NLGEOM` **不是独立关键字**——几何非线性是 `*STEP` 的参数
+#     （`*STEP, NAME=..., NLGEOM=YES`）。单写 `*NLGEOM` 会被 Abaqus 判为
+#     未知关键字直接报错。
+#   * `*STATIC` 数据行只有 4 项：(初始增量, 步长, 最小增量, 最大增量)。
+#     最大增量数属于 `*STEP` 的 `INC` 参数，不是数据行第 6 项。
+#   * `*FIXED MASS SCALING, TYPE=UNIFORM` 必须同时给 `DT`；只给质量缩放因子
+#     时应写 `*FIXED MASS SCALING, FACTOR=<x>`（整步按因子缩放质量）。
+#   * `*DYNAMIC, EXPLICIT` 走自动增量时，数据行第 1 项应为**空**
+#     （空=让 Abaqus 估算稳定增量），第 2 项才是 time period。
 # ---------------------------------------------------------------------------
 
-ANALYSIS_KINDS = ("static", "frequency", "buckle", "contact", "nonlinear",
-                  "explicit")
+# 壳单元的面标签：SPOS/SNEG 是壳的正/负法向面。
+# 壳-壳接触几乎总是在这两个面上，而不是 1..6 里的边界面。
+DEFAULT_MASTER_FACE = "SPOS"
+DEFAULT_SLAVE_FACE = "SNEG"
+
+_DEFAULT_SHELL_ELEMENT = "S4R"
 
 
-def default_analysis(kind="static"):
-    """返回一个分析类型声明 dict（缺省参数齐备，便于 fake/real 同签名）。"""
-    kind = kind or "static"
-    base = {"kind": kind}
-    if kind == "frequency":
-        base["n_modes"] = 10
-    elif kind == "buckle":
-        base["n_modes"] = 5
-        base["load_factor_span"] = 2.0
-    elif kind == "contact":
-        # 接触对：每个 {'master': elset, 'slave': elset, 'friction': mu}
-        base["contacts"] = []
-        base["nlgeom"] = True
-    elif kind == "nonlinear":
-        base["nlgeom"] = True
-        base["nonlinearity"] = "material"   # material | geometry | both
-        base["max_increments"] = 100
-    elif kind == "explicit":
-        base["time_period"] = 0.01
-        base["mass_scaling"] = 1.0
-        base["n_increments_hint"] = 1000
-    return base
+def _element_type(analysis):
+    """壳单元类型：默认 S4R；Explicit 可声明其他显式壳（铺层要求壳族）。"""
+    et = str((analysis or {}).get("element_type") or _DEFAULT_SHELL_ELEMENT)
+    return et.upper()
+
+
+def _nlgeom(analysis):
+    """
+    是否要几何非线性。
+
+    判定口径与 core/analysis.py 一致：显式 nlgeom 为真，或者 nonlinearity
+    声明了 geometry/both。返回 True 时写进 `*STEP, NLGEOM=YES`。
+    """
+    a = analysis or {}
+    if a.get("nlgeom"):
+        return True
+    return a.get("nonlinearity") in ("geometry", "both")
+
+
+def _step_name(step, analysis):
+    """
+    分析步名。
+
+    analysis 提供了 step_name 就用它（每个分析类型一个稳定名字，便于 ODB 定位）；
+    未启用分析类型时沿用 P1 的 step['name']（零回归）。
+    """
+    if analysis:
+        name = analysis.get("step_name")
+        if name:
+            return name
+    return (step or {}).get("name", "Step-1")
+
+
+def _step_params(analysis):
+    """`*STEP` 关键字上的附加参数（目前只有 NLGEOM 与 INC）。"""
+    parts = []
+    if _nlgeom(analysis):
+        parts.append("NLGEOM=YES")
+    a = analysis or {}
+    kind = a.get("kind") or ""
+    if kind in ("nonlinear", "contact"):
+        # 最大增量数是 *STEP, INC= 的参数（*STATIC 数据行里没有这一项）
+        max_inc = int(a.get("max_increments", 100) or 100)
+        if max_inc > 0:
+            parts.append("INC=%d" % max_inc)
+    if not parts:
+        return ""
+    return ", " + ", ".join(parts)
+
+
+def _static_data_line(analysis, default_init=0.1):
+    """`*STATIC` 数据行：初始增量, 步长, 最小增量, 最大增量（仅 4 项）。"""
+    a = analysis or {}
+    init = float(a.get("initial_increment", default_init) or default_init)
+    return "%s, 1.0, 1e-05, 1.0" % _fmt(init)
 
 
 def _step_block(step, analysis, model_dict):
@@ -254,42 +324,82 @@ def _step_block(step, analysis, model_dict):
         kind = analysis.get("kind", "static")
     else:
         kind = step.get("type", "static")
+    a = analysis or {}
 
     if kind == "frequency":
         n = int((analysis or step).get("n_modes", 10))
-        return kind, ["*FREQUENCY", "%d, , , , ," % n]
+        # *FREQUENCY 数据行：特征值个数, 最小频率, 最大频率
+        return kind, ["*FREQUENCY", "%d, ," % n]
     if kind == "buckle":
         n = int((analysis or step).get("n_modes", 5))
-        return kind, ["*BUCKLE", "%d, , , , ," % n]
+        # *BUCKLE 数据行：特征值个数, 精度, 最大迭代次数
+        return kind, ["*BUCKLE", "%d, , ," % n]
     if kind == "explicit":
-        a = analysis or {}
-        period = a.get("time_period", 0.01)
+        period = float(a.get("time_period", 0.01))
+        # *STEP 之后必须紧跟过程关键字（*DYNAMIC），再是它的数据行；
+        # 质量缩放是步级历史数据，写在数据行**之后**。
         lines = ["*DYNAMIC, EXPLICIT"]
-        lines.append("%s, %s" % (_fmt(period), _fmt(period)))
-        # 质量缩放：给一个稳定时间增量缩放因子，显式分析常用手法
-        if a.get("mass_scaling"):
-            lines.insert(1, "*FIXED MASS SCALING, FACTOR=%s, TYPE=UNIFORM"
-                         % _fmt(a.get("mass_scaling")))
+        # 自动增量：第 1 项空着（让 Abaqus 估稳定增量），第 2 项是 time period
+        lines.append(", %s" % _fmt(period))
+        # 质量缩放：整步一次按因子缩放质量。FACTOR=1 即不缩放（合法且显式留痕）。
+        lines.append("*FIXED MASS SCALING, FACTOR=%s"
+                     % _fmt(float(a.get("mass_scaling", 1.0))))
         return kind, lines
     if kind == "contact":
-        # 接触分析：静力步 + 几何非线性，接触定义在 *STEP 之前由 _contact_block 写
-        return kind, ["*STATIC", "0.1, 1.0, 1e-05, 1.0", "*NLGEOM"]
+        # 接触分析：静力步（NLGEOM 由 _step_params 写在 *STEP 上）；
+        # 接触定义在 *STEP 之前由 _contact_block 写。
+        return kind, ["*STATIC", _static_data_line(a)]
     if kind == "nonlinear":
-        a = analysis or {}
-        lines = ["*STATIC"]
-        max_inc = int(a.get("max_increments", 100))
-        lines.append("0.1, 1.0, 1e-05, 1.0, , %d" % max_inc)
-        if a.get("nlgeom") or a.get("nonlinearity") in ("geometry", "both"):
-            lines.append("*NLGEOM")
-        return kind, lines
+        return kind, ["*STATIC", _static_data_line(a)]
+    # 静态默认：与 P1 完全一致（零回归）
     return "static", ["*STATIC", "0.1, 1.0, 1e-05, 1.0"]
+
+
+def _damage_block(analysis):
+    """
+    材料非线性（票14）：复合材料 Hashin 损伤起始。
+
+    产出的关键字紧跟 `*ELASTIC`/`*DENSITY`（同属一个 `*MATERIAL`），
+    只有 `nonlinearity` 声明了 material/both 时才写——这样"材料非线性"
+    真的进了 .inp，而不是只在宿主侧的一个布尔标记。
+    """
+    a = analysis or {}
+    if a.get("kind") != "nonlinear":
+        return []
+    if a.get("nonlinearity") not in ("material", "both"):
+        return []
+    damage = a.get("damage")
+    if not damage:
+        return []
+
+    def g(key):
+        return _fmt(float(damage.get(key, 0.0)))
+
+    lines = ["*DAMAGE INITIATION, CRITERION=HASHIN, ALPHA=1."]
+    # 数据行：Xt, Xc, Yt, Yc, Sl, St（纵向/横向拉压强度 + 纵横剪切强度）
+    lines.append("%s, %s, %s, %s, %s, %s"
+                 % (g("Xt"), g("Xc"), g("Yt"), g("Yc"), g("Sl"), g("St")))
+    return lines
+
+
+def _face_label(value, default):
+    """接触面标签：整数面号 -> 'S<n>'；已有字母标签原样大写。"""
+    if value is None or value == "":
+        return default
+    txt = str(value).strip().upper()
+    try:
+        return "S%d" % int(txt)
+    except ValueError:
+        return txt
 
 
 def _contact_block(analysis):
     """
     产出接触定义行（*SURFACE / *CONTACT PAIR / *SURFACE INTERACTION）。
 
-    接触对写在 *STEP 之前（模型数据），这是 Abaqus 的合法位置。
+    接触对写在 *STEP 之前（模型数据区），这是 Abaqus 的合法位置。
+    `analysis["contacts"]` 里声明的每个接触对都在这里落成 .inp 关键字，
+    于是"声明了接触对"与"模型里真的有接触"是同一件事。
     """
     if not analysis:
         return []
@@ -304,13 +414,16 @@ def _contact_block(analysis):
         if not master or not slave:
             continue
         mu = float(cp.get("friction", 0.2))
+        mface = _face_label(cp.get("master_face"), DEFAULT_MASTER_FACE)
+        sface = _face_label(cp.get("slave_face"), DEFAULT_SLAVE_FACE)
         lines.append("*SURFACE INTERACTION, NAME=INT-%d" % i)
         lines.append("*FRICTION")
+        # 摩擦数据行：摩擦系数, 滑移速度（0 = 静摩擦/无速度相关）
         lines.append("%s, 0." % _fmt(mu))
         lines.append("*SURFACE, TYPE=ELEMENT, NAME=SURF-M%d" % i)
-        lines.append("%s, S%d" % (master, int(cp.get("master_face", 1))))
+        lines.append("%s, %s" % (master, mface))
         lines.append("*SURFACE, TYPE=ELEMENT, NAME=SURF-S%d" % i)
-        lines.append("%s, S%d" % (slave, int(cp.get("slave_face", 2))))
+        lines.append("%s, %s" % (slave, sface))
         lines.append("*CONTACT PAIR, INTERACTION=INT-%d, TYPE=SURFACE TO SURFACE"
                      % i)
         lines.append("SURF-S%d, SURF-M%d" % (i, i))

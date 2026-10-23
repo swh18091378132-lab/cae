@@ -108,11 +108,28 @@ class RunOptions(object):
     }
 
     def __init__(self, **kwargs):
-        self._explicit = set(kwargs.keys())
+        # 先关掉跟踪，把默认值灌进去；跟踪打开后**任何**对已声明字段的赋值都算
+        # "显式设置"（包括 `opts.analysis = "...":` 这种直接赋值，见 __setattr__）。
+        object.__setattr__(self, "_explicit", set(kwargs.keys()))
+        object.__setattr__(self, "_track", False)
         for name, default in self.DEFAULTS.items():
-            setattr(self, name, kwargs.pop(name, default))
+            object.__setattr__(self, name, kwargs.pop(name, default))
         # 未知字段照存不丢（字典/列表等可变默认值无需深拷贝：调用方各自传入）
-        self.extra = kwargs
+        object.__setattr__(self, "extra", kwargs)
+        object.__setattr__(self, "_track", True)
+
+    def __setattr__(self, name, value):
+        """
+        直接赋值也要记进 `_explicit`。
+
+        否则 `opts.analysis = "explicit"`（本类文档与 CLI 都这么写）会在
+        `overlay()` 里被当成"没设置过"而丢掉——那就是静默失效。
+        """
+        object.__setattr__(self, name, value)
+        if (name in self.DEFAULTS
+                and getattr(self, "_track", False)
+                and getattr(self, "_explicit", None) is not None):
+            self._explicit.add(name)
 
     # -- 读写 --------------------------------------------------------------
 
@@ -209,6 +226,20 @@ def _normalize_analysis(analysis):
         raise StudyRunError("分析类型无效: %s" % exc)
 
 
+def _effective_step_name(fe, analysis_spec):
+    """
+    .inp 里实际写出的分析步名（票14）。
+
+    启用分析类型时由 fe_build 按类型取名（Explicit-1 / Frequency-1 ...），
+    未启用时沿用 P1 的 step 名。产物里记的是**真实写进 .inp 的那个名字**，
+    否则用 ODB 找 step 时会找不到。
+    """
+    if analysis_spec:
+        return analysis_spec.get("step_name") or \
+            (analysis_spec.get("kind") or "static").title() + "-1"
+    return (fe.step or {}).get("name", "Step-1")
+
+
 def _mesh_quality_artifact_params(fe):
     """网格质量门（票15）要写进 mesh 产物 params 的字段；未启用则为空。"""
     q = getattr(fe, "mesh_quality", None) or {}
@@ -254,6 +285,10 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
     新增能力时往 RunOptions 加字段即可，本签名保持不变。
     """
     opts = RunOptions.coerce(options, legacy)
+
+    # 0) 分析类型声明先归一 + 校验（票14）：非法声明在**产生任何产物之前**就拒绝，
+    #    不留下"参数集/数模/拓扑都落了、到 FE 才报错"的半成品。
+    analysis_spec = _normalize_analysis(opts.analysis)
 
     params_dir = opts.params_dir
     templates_dir = opts.templates_dir
@@ -358,7 +393,6 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
     if with_fe_model:
         if not with_topology:
             raise StudyRunError("构建 FE 模型需要先启用 with_topology")
-        analysis_spec = _normalize_analysis(opts.analysis)
         try:
             fe = fe_model.build_fe_model(
                 model, fe_dir or (os.path.join(params_dir, "fe") if params_dir else "fe"),
@@ -380,9 +414,11 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
 
         inp_id = add_artifact(
             study_id, "inp", content_uri=fe.inp_path,
-            params={"step": fe.step.get("name"),
-                    "step_type": fe.step.get("type"),
+            params={"step": _effective_step_name(fe, analysis_spec),
+                    "step_type": (analysis_spec or {}).get(
+                        "kind", fe.step.get("type")),
                     "analysis_kind": (analysis_spec or {}).get("kind", "static"),
+                    "analysis": analysis_spec,
                     "n_plies": fe.laminate["n_plies"],
                     "total_thickness": fe.laminate["total_thickness"],
                     "load": fe.load},
@@ -418,13 +454,14 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         if not os.path.isdir(sdir):
             os.makedirs(sdir)
 
-        analysis_spec = result.get("analysis") or _normalize_analysis(opts.analysis)
+        step_name_hint = _effective_step_name(fe, analysis_spec) \
+            if analysis_spec else None
         solve_kwargs = {}
         if analysis_spec:
             solve_kwargs["analysis"] = analysis_spec
         try:
-            sol = abaqus.solve(fe.inp_path, job_name, sdir, step_name=None,
-                               **solve_kwargs)
+            sol = abaqus.solve(fe.inp_path, job_name, sdir,
+                               step_name=step_name_hint, **solve_kwargs)
         except TypeError:
             # 兼容只实现 P1 签名的第三方 runner（协议向后兼容）
             sol = abaqus.solve(fe.inp_path, job_name, sdir, step_name=None)
@@ -445,7 +482,6 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             ext = abaqus.extract(sol.odb_path, sdir)
         except Exception as exc:
             raise StudyRunError("结果抽取失败: %s" % exc)
-
         ext_id = add_artifact(
             study_id, "extraction", content_uri=ext.csv_path,
             params={"n_rows": ext.manifest.get("n_rows"),
@@ -454,14 +490,21 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
                     "position": ext.manifest.get("position"),
                     "source_odb_sha256": ext.manifest.get("source_odb_sha256"),
                     "abaqus_version": ext.manifest.get("abaqus_version"),
-                    "python_version": ext.manifest.get("python_version")},
+                    "python_version": ext.manifest.get("python_version"),
+                    # 票14：分析类型记为**元信息**，抽取口径（字段/列）不变
+                    "analysis_kind": ext.manifest.get("analysis_kind"),
+                    "step": ext.manifest.get("step")},
             conn=conn)
         link(odb_id, ext_id, conn=conn)
 
         result["artifacts"]["odb"] = odb_id
         result["artifacts"]["extraction"] = ext_id
         result["solve"] = {"job": job_name, "status": sol.status,
-                           "odb_path": sol.odb_path}
+                           "odb_path": sol.odb_path,
+                           "analysis_kind": (analysis_spec or {}).get(
+                               "kind", "static"),
+                           "step": sol.analysis.get("step_name")
+                           if getattr(sol, "analysis", None) else None}
         result["extraction"] = {
             "csv_path": ext.csv_path,
             "manifest_path": ext.manifest_path,

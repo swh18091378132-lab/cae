@@ -9,6 +9,20 @@ abaqus_runner.py -- Abaqus 求解与抽取的宿主侧封装（票 05）
 
 与 catia_driver 一样提供 **协议 + Fake + Real** 三件套，测试不依赖真机。
 
+## 票14：分析类型
+
+`solve()` 增加 `analysis` 参数（分析类型声明 dict 或 None），fake 与 real **同签名**。
+分析类型在 Abaqus 侧的落实分两处，彼此不重叠：
+
+  * **.inp 内容**：分析步 / 接触 / 损伤起始 / 元素类型（见 fe_build.py）。
+    求解命令本身不变——Abaqus 从输入文件里的过程关键字自动判断 Standard / Explicit。
+  * **ODB 元信息**：分析类型随 ODB 一起落盘（fake 写进 ODB，real 落在 manifest），
+    抽取时原样记进 manifest，于是"这次结果是按哪种分析跑的"可追溯、可回归。
+
+**抽取格式与分析类型无关**（票14 硬验收）：无论哪种类型，都是同一套
+element × section_point × field 的 CSV + 同一份 manifest 口径，强度校核逻辑
+不需要按分析类型分支。分析类型只出现在 manifest 的元信息字段里，永不进数据列。
+
 兼容 Python 3.8（宿主侧）。
 """
 
@@ -24,22 +38,72 @@ except ImportError:
     from study import add_artifact, link
 
 
+# 抽取 CSV 的表头（fake 与 real 必须一致；ADR-0006 的中性文本口径）
+CSV_HEADER = ["field", "elem", "node", "ip", "sp", "component", "value"]
+
+# manifest 里与本票相关的元信息键（测试用来断言"口径一致"）
+FIXED_MANIFEST_KEYS = (
+    "schema", "job", "source_odb", "source_odb_sha256", "abaqus_version",
+    "python_version", "step", "frame_value", "fields", "fields_present",
+    "position", "integration_point_mode", "n_rows", "n_section_points",
+    "section_points", "units_note", "csv", "analysis_kind",
+)
+
+# 未声明分析类型时按 P1 的静力默认（零回归）
+_DEFAULT_ANALYSIS = {"kind": "static", "step_name": "Static-1"}
+
+# fake ODB 里记录分析声明的标记行前缀（人类可读 + 可机器解析）
+_ANALYSIS_MARK = "ANALYSIS-JSON: "
+
+
+def _analysis_mod():
+    """宿主侧的分析类型定义（唯一权威处在 core/analysis.py）。"""
+    try:
+        from . import analysis as analysis_mod
+    except ImportError:
+        import analysis as analysis_mod
+    return analysis_mod
+
+
 class SolveResult(object):
-    def __init__(self, job_name, odb_path, status, log_tail=""):
+    def __init__(self, job_name, odb_path, status, log_tail="", analysis=None):
         self.job_name = job_name
         self.odb_path = odb_path
         self.status = status
         self.log_tail = log_tail
+        # 票14：本次求解所用的分析类型声明（可追溯）
+        self.analysis = analysis
 
     def __repr__(self):
         return "SolveResult(%s, %s)" % (self.job_name, self.status)
 
 
 class ExtractResult(object):
-    def __init__(self, csv_path, manifest_path, manifest):
+    def __init__(self, csv_path, manifest_path, manifest,
+                 rows=None, header=None):
         self.csv_path = csv_path
         self.manifest_path = manifest_path
         self.manifest = manifest
+        # 解析后的 CSV 内容（表头 + 行），方便调用方直接断言口径
+        self.header = list(header or CSV_HEADER)
+        self.rows = list(rows or [])
+
+
+def analysis_of(analysis):
+    """
+    把 None / kind 字符串 / dict 归一成分析声明 dict（只读，不改调用方对象）。
+
+    归一与校验都委托 core/analysis.py —— 适配器不自带影子清单。
+    """
+    if analysis is None or analysis == "":
+        return dict(_DEFAULT_ANALYSIS)
+    mod = _analysis_mod()
+    spec = mod.normalize(analysis)
+    if spec is None:
+        return dict(_DEFAULT_ANALYSIS)
+    out = dict(spec)
+    out.setdefault("step_name", mod.step_name(out))
+    return out
 
 
 class AbaqusRunner(object):
@@ -63,7 +127,10 @@ class FakeAbaqusRunner(AbaqusRunner):
 
     票14 起支持全部分析类型，且**每种类型的抽取格式完全一致**（同字段同口径），
     使后续强度校核无需按类型分支；对同一 (n_elems, n_plies, inject_hotspot)
-    与同一分析类型，输出必须**确定性可回归**。
+    输出必须**确定性可回归**——分析类型只改 manifest 元信息，不改数值口径。
+
+    分析声明写进 fake ODB（求解产物）而不是留在实例属性上：这样"抽取的是哪次求解
+    的产物"就由产物自己决定，多次求解 / 交叉抽取也不会张冠李戴。
     """
 
     def __init__(self, n_elems=6, n_plies=2, inject_hotspot=True):
@@ -76,18 +143,43 @@ class FakeAbaqusRunner(AbaqusRunner):
     def solve(self, inp_path, job_name, work_dir, step_name=None, analysis=None):
         if not os.path.isdir(work_dir):
             os.makedirs(work_dir)
-        self.last_analysis = analysis
-        kind = (analysis or {}).get("kind", "static")
+        spec = analysis_of(analysis)
+        self.last_analysis = spec
         odb = os.path.join(work_dir, "%s.odb" % job_name)
+        payload = {
+            "job": job_name,
+            "source_inp": os.path.abspath(inp_path) if inp_path else "",
+            "step": step_name or spec["step_name"],
+            "analysis": spec,
+        }
         with open(odb, "w", encoding="utf-8") as fh:
             fh.write("FAKE ODB for %s\n" % job_name)
-            fh.write("analysis=%s\n" % kind)
-            if analysis:
-                # 把声明落盘，便于"求解口径可追溯"（真实 Abaqus 也有 .com/.msg）
-                import json as _json
-                fh.write(_json.dumps(analysis, ensure_ascii=False,
-                                     sort_keys=True) + "\n")
-        return SolveResult(job_name, odb, "COMPLETED")
+            fh.write("analysis=%s\n" % spec["kind"])
+            # 声明原样落盘：求解口径可追溯（真机对应 .com/.msg）
+            fh.write(_ANALYSIS_MARK + json.dumps(
+                payload, ensure_ascii=False, sort_keys=True) + "\n")
+        return SolveResult(job_name, odb, "COMPLETED", analysis=spec)
+
+    # -- 内部 --------------------------------------------------------------
+
+    def _read_analysis(self, odb_path):
+        """
+        从 fake ODB 读回分析声明。
+
+        读不到（例如 ODB 不是本 fake 产出的）时退回最近一次求解的声明，
+        再退回静力默认——只为兼容老产物，不改变抽取格式。
+        """
+        try:
+            with open(odb_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith(_ANALYSIS_MARK):
+                        payload = json.loads(line[len(_ANALYSIS_MARK):])
+                        spec = payload.get("analysis") or {}
+                        return analysis_of(spec), payload.get("step")
+        except (IOError, OSError, ValueError):
+            pass
+        spec = analysis_of(self.last_analysis)
+        return spec, spec["step_name"]
 
     def extract(self, odb_path, out_dir, step_name=None):
         if not os.path.isdir(out_dir):
@@ -95,9 +187,7 @@ class FakeAbaqusRunner(AbaqusRunner):
         job = os.path.splitext(os.path.basename(odb_path))[0]
         csv_path = os.path.join(out_dir, "%s_elem_ply.csv" % job)
 
-        # 分析类型只影响 manifest 里的元信息，**不影响 CSV 的字段与口径**：
-        # 这样强度校核（票06）对任何分析类型走同一条代码路径。
-        kind = (self.last_analysis or {}).get("kind", "static")
+        spec, recorded_step = self._read_analysis(odb_path)
 
         rows = []
         # 每个单元每一层给一组应力；其中制造一个热点(高应力)供校核捕获
@@ -108,7 +198,7 @@ class FakeAbaqusRunner(AbaqusRunner):
                     base = 900.0   # 热点：接近许用值
                 rows.append((e, sp, base))
         with open(csv_path, "w", encoding="utf-8", newline="") as fh:
-            fh.write("field,elem,node,ip,sp,component,value\n")
+            fh.write(",".join(CSV_HEADER) + "\n")
             for (e, sp, s11) in rows:
                 fh.write("S,%d,,1,%d,c1,%.6f\n" % (e, sp, s11))
                 fh.write("S,%d,,1,%d,c2,%.6f\n" % (e, sp, s11 * 0.2))
@@ -120,21 +210,27 @@ class FakeAbaqusRunner(AbaqusRunner):
             "source_odb_sha256": "fake",
             "abaqus_version": "FAKE",
             "python_version": "2.7.15-fake",
-            "step": step_name or "Static-1",
+            "step": step_name or recorded_step or spec["step_name"],
             "frame_value": 1.0,
+            "fields": ["S", "U", "E"],
+            "fields_present": ["S", "U"],
+            "integration_point_mode": "INTEGRATION_POINT",
             "n_rows": len(rows),
             "n_section_points": self.n_plies,
             "section_points": list(range(1, self.n_plies + 1)),
             "position": "CENTROID",
             "units_note": "fake units MPa",
             "csv": os.path.basename(csv_path),
-            # 票14：分析类型只作为元信息记录，不改抽取口径
-            "analysis_kind": kind,
+            # 票14：分析类型只作为元信息记录，**不改抽取口径**
+            "analysis_kind": spec["kind"],
+            "analysis_step": spec["step_name"],
+            "analysis": spec,
         }
         man_path = os.path.join(out_dir, "%s_manifest.json" % job)
         with open(man_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2, sort_keys=True, ensure_ascii=False)
-        return ExtractResult(csv_path, man_path, manifest)
+        return ExtractResult(csv_path, man_path, manifest,
+                             rows=rows, header=CSV_HEADER)
 
 
 class RealAbaqusRunner(AbaqusRunner):
@@ -182,7 +278,8 @@ class RealAbaqusRunner(AbaqusRunner):
 
         # 分析类型已在 .inp 的分析步里体现（fe_build._step_block），
         # 故求解命令本身不变；这里记录声明以便追溯。
-        self.last_analysis = analysis
+        spec = analysis_of(analysis)
+        self.last_analysis = spec
 
         rc, out = self._run(
             ["job=%s" % job_name,
@@ -192,7 +289,7 @@ class RealAbaqusRunner(AbaqusRunner):
         odb = os.path.join(work_dir, "%s.odb" % job_name)
         status = "COMPLETED" if os.path.isfile(odb) and "COMPLETED" in out else "FAILED"
         tail = "\n".join(out.strip().splitlines()[-12:])
-        return SolveResult(job_name, odb, status, tail)
+        return SolveResult(job_name, odb, status, tail, analysis=spec)
 
     def extract(self, odb_path, out_dir, step_name=None):
         # 本文件在 <repo>/apps/workbench/core/，extract.py 在 <repo>/abaqus_capabilities/
@@ -213,7 +310,31 @@ class RealAbaqusRunner(AbaqusRunner):
         csv_path = os.path.join(out_dir, "%s_elem_ply.csv" % job)
         man_path = os.path.join(out_dir, "%s_manifest.json" % job)
         if not os.path.isfile(csv_path):
-            raise RuntimeError("未产出 CSV:\n%s" % out[-2000:])
+            raise RuntimeError("未产出 CSV:\n%s" % (out[-2000:]))
         with open(man_path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
-        return ExtractResult(csv_path, man_path, manifest)
+        # 真机 extract.py 在 Abaqus 内置 Python 2.7 跑，不知道分析类型；
+        # 由宿主侧把它补进 manifest（抽取口径本身不变，只补元信息）。
+        spec = analysis_of(self.last_analysis)
+        manifest.setdefault("analysis_kind", spec["kind"])
+        manifest.setdefault("analysis_step", spec["step_name"])
+        manifest.setdefault("analysis", spec)
+        with open(man_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2, sort_keys=True, ensure_ascii=False)
+
+        header, rows = _read_csv(csv_path)
+        return ExtractResult(csv_path, man_path, manifest,
+                             rows=rows, header=header)
+
+
+def _read_csv(csv_path):
+    """读回抽取 CSV（表头 + 行），供调用方断言"口径一致"。"""
+    import csv as _csv
+    with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+        rd = _csv.reader(fh)
+        try:
+            header = next(rd)
+        except StopIteration:
+            return [], []
+        rows = [r for r in rd if r]
+    return header, rows
