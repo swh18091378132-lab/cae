@@ -38,7 +38,10 @@ import run_study
 from catia_driver import FakeCatiaDriver
 
 
-TMP = os.path.join(WORKBENCH, ".tmp_test", "m15")
+TMP_BASE = os.path.join(WORKBENCH, ".tmp_test", "m15")
+#: 每次运行用独立子目录：`run_tests.py` 可能与本票的单测被并行执行，
+#: 共用一个固定目录会在 Windows 上撞文件锁（WinError 32）。
+TMP = os.path.join(TMP_BASE, "run_%d" % os.getpid())
 
 # P1 机翼盒段基线参数（与 test_m2 / test_m3 / test_m11 完全一致）
 BASE_PARAMS = {
@@ -580,7 +583,10 @@ def test_end_to_end_trace(fails):
     """4) 端到端：不达标结论进入 result["warnings"] 与 mesh 产物 params。"""
     dbfile = os.path.join(TMP, "m15.db")
     if os.path.isfile(dbfile):
-        os.remove(dbfile)
+        try:
+            os.remove(dbfile)
+        except OSError:
+            pass
     conn = db.connect(dbfile)
     study.create_study("S-M15", "M15 质量门", conn=conn)
 
@@ -662,10 +668,20 @@ def test_py38(fails):
                      % compat_py38.format_violations(bad))
 
 
+def _rmtree_quiet(path):
+    """尽力删除临时目录；Windows 上文件锁导致的失败不再中断测试。"""
+    if not os.path.isdir(path):
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
 def main():
-    if os.path.isdir(TMP):
-        shutil.rmtree(TMP)
-    os.makedirs(TMP)
+    _rmtree_quiet(TMP)
+    if not os.path.isdir(TMP):
+        os.makedirs(TMP)
 
     fails = []
     print("1-2. 质量指标计算与手算对照 ...")
