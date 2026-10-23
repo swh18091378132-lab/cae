@@ -105,6 +105,10 @@ class RunOptions(object):
         # --- P2 扩展位（先占位，由后续票填充语义）---
         "mesh_quality": None,      # 票15：网格质量门策略
         "model_config_id": None,   # 票16：型号配置引用
+        # --- P3（票22）：铺层轮次跳过数模再生 ---
+        # 设为源 study_id 时跳过 catia.regenerate，复用源 Study 的数模产物。
+        # 依据 ADR-0005：铺层是 CAE 属性，几何没变就不必再生数模。
+        "reuse_catpart_from": None,
     }
 
     def __init__(self, **kwargs):
@@ -380,6 +384,100 @@ def _study_name(study_id, conn):
         return study_id
 
 
+# ---------------------------------------------------------------------------
+# 票22：复用源 Study 的数模（铺层轮次跳过 CATIA 再生）
+# ---------------------------------------------------------------------------
+
+class CatPartReuseError(StudyRunError):
+    """复用数模的前提条件不成立（源 Study 不存在 / 数模缺失 / 几何已变）。"""
+
+
+def _latest_artifact(conn, study_id, kind):
+    """取某 Study 某类产物的最新版本行；没有返回 None。"""
+    return conn.execute(
+        "SELECT * FROM artifacts WHERE study_id=? AND kind=? "
+        "ORDER BY version DESC LIMIT 1", (study_id, kind)).fetchone()
+
+
+def _catpart_checksum(row):
+    """
+    从数模产物的 params 里取内容指纹。
+
+    复用数模时**必须沿用源 Study 的指纹**（而不是重算/新造）：指纹是"这是同一份数模"
+    的唯一证据，重算会让血缘上看起来像换了一份数模。
+    """
+    try:
+        from . import textfmt
+    except ImportError:
+        import textfmt
+    meta = textfmt.json_loads(row["params_json"], {}) or {}
+    return meta.get("checksum") or row["checksum"]
+
+
+def _resolve_reusable_catpart(conn, source_study_id, params, template_id,
+                              target_study_id=None):
+    """
+    取源 Study 可复用的数模产物，并**校验复用前提**。
+
+    为什么在这里校验几何一致性：能否复用是 design_vector 的判断（几何变量是否变化），
+    但 run_study 拿不到设计向量声明。它能拿到的是**参数集**——而数模正是由参数集驱动的
+    （ADR-0004）。于是最诚实的守卫就是：当前参数集必须与源 Study 的数模参数集一致。
+    不一致还复用，就会产出"数模是旧几何、拓扑是新几何"的血缘，这是不可追溯的错配。
+
+    返回源 catpart 产物行；不满足前提抛 CatPartReuseError。
+    """
+    if not source_study_id:
+        raise CatPartReuseError("reuse_catpart_from 为空")
+    if target_study_id and source_study_id == target_study_id:
+        # 自引用会在血缘 DAG 上造一个自环，拓扑排序会退化
+        raise CatPartReuseError(
+            "复用数模失败：源 Study 与当前 Study 相同（%r），无法复用于自身"
+            % (source_study_id,))
+
+    row = conn.execute("SELECT id FROM studies WHERE id=?",
+                       (source_study_id,)).fetchone()
+    if row is None:
+        raise CatPartReuseError(
+            "复用数模失败：源 Study %r 不存在" % (source_study_id,))
+
+    src_cat = _latest_artifact(conn, source_study_id, "catpart")
+    if src_cat is None:
+        raise CatPartReuseError(
+            "复用数模失败：源 Study %r 没有数模产物（它是否跑过 CATIA 再生？）"
+            % (source_study_id,))
+    if not src_cat["content_uri"] or not os.path.isfile(src_cat["content_uri"]):
+        raise CatPartReuseError(
+            "复用数模失败：源 Study %r 的数模文件不可用（%r）"
+            % (source_study_id, src_cat["content_uri"]))
+
+    try:
+        from . import textfmt
+    except ImportError:
+        import textfmt
+
+    # 几何一致性：数模由参数集驱动，参数集变了数模就过期了
+    src_ps = _latest_artifact(conn, source_study_id, "parameter_set")
+    src_params = textfmt.json_loads(
+        src_ps["params_json"], {}) if src_ps is not None else {}
+    if src_params:
+        diff = sorted(k for k in set(list(src_params) + list(params))
+                      if src_params.get(k) != params.get(k))
+        if diff:
+            raise CatPartReuseError(
+                "复用数模失败：几何参数与源 Study %r 不一致（%s），"
+                "数模已过期；几何变动必须重新再生数模（ADR-0005）"
+                % (source_study_id, ", ".join(diff)))
+
+    src_meta = textfmt.json_loads(src_cat["params_json"], {}) or {}
+    if template_id and src_meta.get("template") \
+            and src_meta["template"] != template_id:
+        raise CatPartReuseError(
+            "复用数模失败：源 Study %r 的数模来自模板 %r，与本次模板 %r 不同"
+            % (source_study_id, src_meta["template"], template_id))
+
+    return src_cat
+
+
 def run_study(study_id, parameter_set, template_id, catia, conn,
               options=None, **legacy):
     """
@@ -451,16 +549,44 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
     ps_id = add_artifact(study_id, "parameter_set", content_uri=params_uri,
                          params=params, conn=conn)
 
-    # 3) CATIA 再生参数化数模
-    try:
-        catpart = catia.regenerate(params, tpl)
-    except Exception as exc:
-        raise StudyRunError("CATIA 再生失败: %s" % exc)
-
-    cat_id = add_artifact(study_id, "catpart", content_uri=catpart.path,
-                          params={"template": tpl.id, "checksum": catpart.checksum},
-                          conn=conn)
-    link(ps_id, cat_id, conn=conn)
+    # 3) 参数化数模：CATIA 再生 **或** 复用源 Study 的数模（票22）
+    #
+    # 复用分支的依据是 ADR-0005：铺层是 CAE 属性，几何没变就不必再生数模。
+    # 于是一场"纯铺层轮次"可以完全跳过 CATIA —— 这是可观测的验收点：
+    # 复用分支里**一次都不碰 catia**（连 isinstance 之类的探测都不做），
+    # 所以会计数的 fake 驱动必然是 0 次。
+    reuse_from = opts.reuse_catpart_from
+    catpart_reuse = None
+    if reuse_from:
+        src_cat = _resolve_reusable_catpart(conn, reuse_from, params, tpl.id,
+                                            target_study_id=study_id)
+        cat_id = add_artifact(
+            study_id, "catpart", content_uri=src_cat["content_uri"],
+            params={"template": tpl.id,
+                    "checksum": _catpart_checksum(src_cat),
+                    "reused_from": reuse_from,
+                    "reused_from_artifact": src_cat["id"]},
+            conn=conn)
+        # 血缘：源数模 -> 本次数模（"复用自某 Study"，设计点仍可一跳回溯到几何真源）
+        link(src_cat["id"], cat_id, conn=conn)
+        link(ps_id, cat_id, conn=conn)
+        catpart_path = src_cat["content_uri"]
+        catpart_checksum = _catpart_checksum(src_cat)
+        catpart_reuse = {"from_study": reuse_from,
+                         "from_artifact": src_cat["id"],
+                         "checksum": catpart_checksum}
+    else:
+        try:
+            catpart = catia.regenerate(params, tpl)
+        except Exception as exc:
+            raise StudyRunError("CATIA 再生失败: %s" % exc)
+        cat_id = add_artifact(study_id, "catpart", content_uri=catpart.path,
+                              params={"template": tpl.id,
+                                      "checksum": catpart.checksum},
+                              conn=conn)
+        link(ps_id, cat_id, conn=conn)
+        catpart_path = catpart.path
+        catpart_checksum = catpart.checksum
 
     result = {
         "study_id": study_id,
@@ -468,9 +594,11 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         "template": tpl.id,
         "parameters": params,
         "artifacts": {"parameter_set": ps_id, "catpart": cat_id},
-        "catpart_path": catpart.path,
-        "catpart_checksum": catpart.checksum,
+        "catpart_path": catpart_path,
+        "catpart_checksum": catpart_checksum,
     }
+    if catpart_reuse is not None:
+        result["catpart_reuse"] = catpart_reuse
 
     # 3.5) 型号配置关联（票16 的 `model_config_id`，spec 关键契约要求 run_study 接受它）
     # 在参数契约校验通过、参数集产物落盘之后做：到这一步该 Study 已经确定要跑，
