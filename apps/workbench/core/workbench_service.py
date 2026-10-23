@@ -24,6 +24,8 @@ try:
     from . import approval
     from . import model_config as model_config_mod
     from . import model_rollup as rollup_mod
+    from . import optimization_loop as optloop_mod
+    from . import objectives as objectives_mod
     from . import textfmt
     from .catia_driver import FakeCatiaDriver, RealCatiaDriver
     from .abaqus_runner import FakeAbaqusRunner, RealAbaqusRunner
@@ -36,6 +38,8 @@ except ImportError:
     import approval
     import model_config as model_config_mod
     import model_rollup as rollup_mod
+    import optimization_loop as optloop_mod
+    import objectives as objectives_mod
     import textfmt
     from catia_driver import FakeCatiaDriver, RealCatiaDriver
     from abaqus_runner import FakeAbaqusRunner, RealAbaqusRunner
@@ -43,6 +47,119 @@ except ImportError:
 
 class ServiceError(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# 优化汇总视图用到的常量与纯函数（票28：无 UI 依赖，可单测）
+#
+# **位置注意**：这些常量必须在 `class WorkbenchService` **之前**定义 ——
+# `adopt_optimization_point` 等方法把 `OPTIMIZE_ROLE_SIGNER` 用作参数默认值，
+# 而默认值在类创建时就求值了。
+# ---------------------------------------------------------------------------
+
+#: 采用优化方案所需角色。与报告签发同级（ADR-0002：方案采用是 L2 人决策），
+#: 直接沿用 `approval.record_optimize_decision` 的既有约束，不另立权限体系。
+OPTIMIZE_ROLE_SIGNER = approval.ROLE_SIGNER
+OPTIMIZE_ROLE_REVIEWER = approval.ROLE_REVIEWER
+OPTIMIZE_ROLE_DESIGN = approval.ROLE_DESIGN
+OPTIMIZE_ROLE_ANALYSIS = approval.ROLE_ANALYSIS
+
+#: 优化页可切换的角色（UI 下拉框用；只有签发角色能采用/维持原设计）
+OPTIMIZE_ROLE_CHOICES = (
+    (OPTIMIZE_ROLE_SIGNER, "签发（可采用/维持原设计）"),
+    (OPTIMIZE_ROLE_DESIGN, "设计（只读）"),
+    (OPTIMIZE_ROLE_REVIEWER, "审核（只读）"),
+    (OPTIMIZE_ROLE_ANALYSIS, "强度分析（只读）"),
+)
+
+#: 会话状态中文名
+OPTIMIZE_SESSION_STATUS_NAMES = {
+    optloop_mod.SESSION_CREATED: "已创建（未开始评估）",
+    optloop_mod.SESSION_RUNNING: "优化中",
+    optloop_mod.SESSION_FINISHED: "已完成",
+    optloop_mod.SESSION_FAILED: "编排失败",
+}
+
+#: 三分组中文名（与 objectives 的三分组语义一一对应）
+OPTIMIZE_GROUP_NAMES = {
+    optloop_mod.GROUP_FEASIBLE: "可行",
+    optloop_mod.GROUP_INFEASIBLE: "不可行",
+    optloop_mod.GROUP_FAILED: "评估失败",
+}
+
+#: 技术故障分类的中文名（"算不出来"要能和"设计不好"分开说）
+OPTIMIZE_ERROR_KIND_NAMES = {
+    objectives_mod.ErrorKind.PARAM_ERROR: "参数越界/包络外",
+    objectives_mod.ErrorKind.MESH_VIOLATION: "网格破戒",
+    objectives_mod.ErrorKind.NO_CHECK: "未跑到校核",
+    objectives_mod.ErrorKind.NO_MASS: "算不出质量",
+    objectives_mod.ErrorKind.RUN_FAILED: "求解/建模失败",
+    objectives_mod.ErrorKind.UNKNOWN: "未知故障",
+}
+
+
+def _decision_text(decision):
+    """采用决策的中文描述（UI 提示与文本渲染共用）。"""
+    if decision == approval.DECISION_ADOPT:
+        return "已采用优化方案"
+    if decision == approval.DECISION_KEEP_ORIGINAL:
+        return "维持原设计"
+    return "尚未决策"
+
+
+def _constraint_value(point, key):
+    """从设计点的约束值里取一个数（取不到返回 None，不编造 0）。"""
+    if not point:
+        return None
+    cons = point.get("constraints") or {}
+    values = cons.get("values") or {}
+    return _as_float(values.get(key))
+
+
+def optimize_session_label(row):
+    """会话列表一行的文字：「名称 · 模板 · 状态 · N 点（可行 a / 不可行 b / 失败 c）· 采用状态」。"""
+    counts = row.get("counts") or {}
+    head = "%s · %s · %s" % (row.get("name") or row.get("session_id"),
+                             row.get("template_id") or "-",
+                             row.get("status_name") or row.get("status") or "-")
+    tail = " · %d 点（可行 %s / 不可行 %s / 评估失败 %s）" % (
+        row.get("n_points", 0),
+        counts.get(optloop_mod.GROUP_FEASIBLE, 0),
+        counts.get(optloop_mod.GROUP_INFEASIBLE, 0),
+        counts.get(optloop_mod.GROUP_FAILED, 0))
+    adopted = row.get("adoption") or {}
+    if adopted.get("decided"):
+        tail += " · %s" % _decision_text(adopted.get("decision"))
+    else:
+        tail += " · 未决策"
+    return "%s%s" % (head, tail)
+
+
+def optimize_point_label(point):
+    """
+    设计点一行的文字：「#id · 分组 · 质量 X kg · max_FI / min_MS · 是否最优」。
+
+    分组与数值都来自库里的事实；技术故障点显式写"算不出来"并带原因，
+    **不会**被显示成一个目标值很差的普通设计点。
+    """
+    bits = ["#%s" % point.get("point_id"),
+            OPTIMIZE_GROUP_NAMES.get(point.get("group_name"),
+                                     point.get("group_name") or "-")]
+    if point.get("ok") is False:
+        err = point.get("error") or {}
+        bits.append("算不出来[%s]"
+                    % (OPTIMIZE_ERROR_KIND_NAMES.get(err.get("kind"),
+                                                     err.get("kind") or "?")))
+    else:
+        bits.append("质量 %s kg" % _fmt_num(point.get("objective_value")))
+        bits.append("max_FI %s / min_MS %s"
+                    % (_fmt_num(_constraint_value(point, "max_fi")),
+                       _fmt_num(_constraint_value(point, "min_ms"))))
+    if point.get("is_best"):
+        bits.append("★当前最优")
+    if point.get("reused_from"):
+        bits.append("复用数模")
+    return " · ".join(bits)
 
 
 class WorkbenchService(object):
@@ -908,6 +1025,429 @@ class WorkbenchService(object):
             raise ServiceError(str(exc))
         return [self._inbox_row(st, role) for st in states]
 
+    # =======================================================================
+    # 优化汇总视图的应用逻辑（票28）
+    #
+    # 与票19 完全同一个模式：**判据全在服务层**（纯 Python，可脱离 UI 单测），
+    # UI 只调它 + 把返回值摆到控件上。
+    #
+    # 这里**不重造**票25 的 L2 门。票25 已经把门建在 `optimization_loop`：
+    # 未经人批准 `adopted_point()` 恒为 None、`require_adopted_point()` 抛错。
+    # 服务层要做的三件事是：
+    #
+    #   1. **把事实拼成 UI 一页所需的东西**：会话列表 / 汇总 / 设计点血缘 / 前后对比；
+    #   2. **把"能不能采用"变成 (ok, reason)**：UI 据此置灰按钮，
+    #      脚本/CLI 走 assert 版 —— 两层同一个判据，UI 不复制权限表；
+    #   3. **把采用 / 维持原设计包成应用操作**：附带角色与理由，落 L2 审计。
+    #
+    # 角色口径：采用优化方案与签发报告同级的权力，所以只认 `OPTIMIZE_ROLE_SIGNER`。
+    # 这一条来自 `approval.record_optimize_decision` 自身的约束（它已强制 signer），
+    # 服务层提前拦一道，是为了给出"为什么不能点"的可读原因。
+    # =======================================================================
+
+    def list_optimization_sessions(self):
+        """
+        列出全部优化会话（UI 会话列表用）。
+
+        每行是一条**可单独展示的事实**，UI 不需要再去查别的表：
+        ``{session_id, name, template_id, status, status_name, created_at,
+           updated_at, n_points, counts, adopted, adoption, label}``
+        """
+        out = []
+        for sess in optloop_mod.list_sessions(self.conn):
+            sid = sess["session_id"]
+            states = approval.optimize_decisions(self.conn, session_id=sid)
+            adoption = self._optimization_adoption(sid)
+            try:
+                points = optloop_mod.list_points(self.conn, sid)
+            except optloop_mod.OptimizationLoopError:
+                points = []
+            counts = {
+                optloop_mod.GROUP_FEASIBLE: 0,
+                optloop_mod.GROUP_INFEASIBLE: 0,
+                optloop_mod.GROUP_FAILED: 0,
+            }
+            for p in points:
+                counts[p["group_name"]] = counts.get(p["group_name"], 0) + 1
+            row = {
+                "session_id": sid,
+                "name": sess["name"],
+                "template_id": sess["template_id"],
+                "status": sess["status"],
+                "status_name": OPTIMIZE_SESSION_STATUS_NAMES.get(
+                    sess["status"], sess["status"]),
+                "created_at": sess["created_at"],
+                "updated_at": sess["updated_at"],
+                "n_points": len(points),
+                "counts": counts,
+                "adopted": (adoption.get("decision") == approval.DECISION_ADOPT),
+                "adoption": adoption,
+                "n_decisions": len(states),
+            }
+            best = None
+            for p in points:
+                if p.get("is_best"):
+                    best = p
+                    break
+            row["best_point_id"] = best["point_id"] if best else None
+            row["best_objective_value"] = (best["objective_value"] if best else None)
+            row["label"] = optimize_session_label(row)
+            out.append(row)
+        return out
+
+    def get_optimization_summary(self, session_id):
+        """
+        取某会话的汇总视图（各点目标值/约束/可行性/是否最优 + 三分组）。
+
+        直接复用 `optimization_loop.summarize`（结论从库里重算，不是内存拼接），
+        再补三样 UI 需要的东西：分组的中文名、每个点的可读 label、采用状态。
+        失败抛 ServiceError（原因可读）。
+        """
+        try:
+            summary = optloop_mod.summarize(self.conn, session_id)
+        except optloop_mod.OptimizationLoopError as exc:
+            raise ServiceError(str(exc))
+        except Exception as exc:
+            raise ServiceError("读取优化汇总失败: %s" % exc)
+
+        summary["status_name"] = OPTIMIZE_SESSION_STATUS_NAMES.get(
+            summary.get("status"), summary.get("status"))
+        # 每个点补可读 label（UI 列表直接显示，不自己拼字符串）
+        for p in summary.get("points") or []:
+            p["label"] = optimize_point_label(p)
+            p["group_label"] = OPTIMIZE_GROUP_NAMES.get(
+                p.get("group_name"), p.get("group_name"))
+        for group, items in (summary.get("groups") or {}).items():
+            for p in items:
+                if "label" not in p or not p.get("label"):
+                    p["label"] = optimize_point_label(p)
+                p["group_label"] = OPTIMIZE_GROUP_NAMES.get(
+                    group, group)
+        # 失败原因也带分组中文名（"算不出来"要能和"设计不好"分开说）
+        for r in summary.get("failed_reasons") or []:
+            r["kind_label"] = OPTIMIZE_ERROR_KIND_NAMES.get(
+                r.get("kind"), r.get("kind"))
+        summary["group_names"] = dict(OPTIMIZE_GROUP_NAMES)
+        summary["text"] = format_optimization_summary_text(summary)
+        return summary
+
+    def format_optimization_summary(self, session_id):
+        """汇总视图的可读渲染（UI 文本框 / CLI 共用）。"""
+        return self.get_optimization_summary(session_id)["text"]
+
+    def get_optimization_point_lineage(self, session_id, point_id):
+        """
+        取一个设计点的完整血缘（点开看"这个数是怎么来的"）。
+
+        血缘本身用既有的 `get_lineage`（它从 artifact/edges 表算拓扑序），
+        这里只把它和设计点、关联 Study、校核结论拼在一起：
+        于是"这一版方案的质量/FI 从哪来"能一路回溯到 .inp 与数模。
+
+        设计点不存在抛 ServiceError。
+        """
+        point = self._optimization_point(session_id, point_id)
+        study_id = point.get("study_id")
+        lineage = self.get_lineage(study_id) if study_id else {
+            "study_id": study_id, "nodes": [], "order": [], "decisions": []}
+        check = None
+        if study_id:
+            try:
+                check = self.get_check_detail(study_id)
+            except Exception:
+                check = None
+        detail = {
+            "session_id": session_id,
+            "point_id": point["point_id"],
+            "seq": point.get("seq"),
+            "study_id": study_id,
+            "vector": point.get("vector") or {},
+            "vector_key": point.get("vector_key"),
+            "group": point.get("group"),
+            "group_name": point.get("group_name"),
+            "group_label": OPTIMIZE_GROUP_NAMES.get(
+                point.get("group_name"), point.get("group_name")),
+            "ok": point.get("ok"),
+            "feasible": point.get("feasible"),
+            "objective_value": point.get("objective_value"),
+            "constraints": point.get("constraints"),
+            "error": point.get("error"),
+            "source": point.get("source"),
+            "reused_from": point.get("reused_from"),
+            "is_best": point.get("is_best"),
+            "artifacts": point.get("artifacts") or {},
+            "lineage": lineage,
+            "lineage_text": (self.format_lineage_text(study_id)
+                             if study_id else "（该设计点没有关联 Study）"),
+            "check": check,
+            "check_text": (check["text"] if check else
+                           "（该设计点没有校核结论）"),
+        }
+        detail["text"] = format_optimization_point_text(detail)
+        return detail
+
+    def format_optimization_point_lineage(self, session_id, point_id):
+        """设计点详情的可读渲染（UI 右侧文本框直接用）。"""
+        return self.get_optimization_point_lineage(session_id, point_id)["text"]
+
+    def get_optimization_comparison(self, session_id):
+        """
+        优化前后对比（质量降低多少、最小 MS 变化多少）。
+
+        「优化前」= 基线点（设计向量默认值 = 当前设计），它同时是「维持原设计」
+        的对照基准；「优化后」按三档取数，**优先级从高到低**：
+
+          adopted      已批准采用的方案（人定的，最可信）
+          keep_original 已决定维持原设计 -> 「优化后」就是基线本身，变化量为 0
+          best_feasible 尚未决策 -> 用**建议**的最优可行点，并标 adopted=False
+          none         没有任何设计点 -> 各项为 None，**不编造数字**
+
+        返回 dict：{before, after, mass_*, min_ms_*, mass_reduction_pct,
+                   basis, adopted, session_id, text}
+        """
+        summary = self.get_optimization_summary(session_id)
+        points = summary.get("points") or []
+        baseline = None
+        for p in points:
+            if p.get("source") == optloop_mod.SOURCE_BASELINE:
+                baseline = p
+                break
+
+        adoption = summary.get("adoption") or {}
+        decision = adoption.get("decision")
+        after = None
+        basis = "none"
+        adopted = False
+        if decision == approval.DECISION_ADOPT:
+            basis = "adopted"
+            adopted = True
+            after = self._optimization_point_or_none(
+                session_id, adoption.get("point_id"))
+        elif decision == approval.DECISION_KEEP_ORIGINAL:
+            basis = "keep_original"
+            after = baseline
+        elif summary.get("best") is not None:
+            basis = "best_feasible"
+            after = summary["best"]
+
+        before = baseline
+        mass_before = before.get("objective_value") if before else None
+        mass_after = after.get("objective_value") if after else None
+        ms_before = _constraint_value(before, "min_ms")
+        ms_after = _constraint_value(after, "min_ms")
+
+        mass_delta = None
+        if mass_before is not None and mass_after is not None:
+            mass_delta = float(mass_after) - float(mass_before)
+        pct = None
+        if mass_delta is not None and float(mass_before):
+            pct = (float(mass_before) - float(mass_after)) \
+                / float(mass_before) * 100.0
+
+        ms_delta = None
+        if ms_before is not None and ms_after is not None:
+            ms_delta = float(ms_after) - float(ms_before)
+
+        cmp = {
+            "session_id": session_id,
+            "basis": basis,
+            "adopted": adopted,
+            "decision": decision,
+            "before": before,
+            "after": after,
+            "mass_before": mass_before,
+            "mass_after": mass_after,
+            "mass_delta": mass_delta,
+            "mass_reduction_pct": pct,
+            "min_ms_before": ms_before,
+            "min_ms_after": ms_after,
+            "min_ms_delta": ms_delta,
+            "mass_unit": "kg",
+            "n_points": summary.get("n_points", 0),
+        }
+        cmp["text"] = format_optimization_comparison_text(cmp)
+        return cmp
+
+    def format_optimization_comparison(self, session_id):
+        """优化前后对比的可读渲染。"""
+        return self.get_optimization_comparison(session_id)["text"]
+
+    # ---------------- 采用 / 维持原设计（L2 人决策门） ----------------
+
+    def can_adopt_optimization(self, session_id, point_id=None, role=None):
+        """
+        采用入口的守卫：返回 ``(ok, reason)``。UI 据此**置灰按钮**并显示原因。
+
+        判据顺序（先状态，后角色 —— 状态是硬约束，角色是权限）：
+          1. 会话已有定案（adopt / keep_original）-> 不可再改（终态）
+          2. 没有可采用的可行点 -> 不可采用（只能维持原设计）
+          3. 角色不是签发角色 -> 无权采用
+          4. 指定了 point_id 但该点不可行 -> 不可采用
+        """
+        try:
+            summary = self.get_optimization_summary(session_id)
+        except ServiceError as exc:
+            return False, str(exc)
+
+        adoption = summary.get("adoption") or {}
+        if adoption.get("decided"):
+            if adoption.get("decision") == approval.DECISION_KEEP_ORIGINAL:
+                return False, "本会话已决定「维持原设计」，不再采用新的优化方案"
+            return False, ("本会话已采用设计点 #%s（已定案，不可改）"
+                           % (adoption.get("point_id"),))
+
+        if point_id is None:
+            rec = summary.get("recommendation") or {}
+            if rec.get("point_id") is None:
+                return False, (rec.get("text")
+                               or "未找到满足约束的可行设计，无可采用的方案")
+        else:
+            try:
+                target = self._optimization_point(session_id, point_id)
+            except ServiceError as exc:
+                return False, str(exc)
+            if not objectives_mod.is_feasible(target.get("evaluation")):
+                return False, ("设计点 #%s 不满足约束（不可行或评估失败），"
+                               "不能作为采用方案" % (point_id,))
+
+        if role is not None and role != OPTIMIZE_ROLE_SIGNER:
+            return False, ("角色「%s」无权采用优化方案（需要「%s」角色）"
+                           % (approval.role_name(role),
+                              approval.role_name(OPTIMIZE_ROLE_SIGNER)))
+        return True, ""
+
+    def assert_can_adopt(self, session_id, point_id=None, role=None):
+        """采用前置断言：不满足抛 ServiceError（脚本/CLI 与 UI 共用同一判据）。"""
+        ok, reason = self.can_adopt_optimization(session_id, point_id, role)
+        if not ok:
+            raise ServiceError(reason)
+        return True
+
+    def adopt_optimization_point(self, session_id, point_id=None,
+                                role=OPTIMIZE_ROLE_SIGNER, operator=None,
+                                rationale=None):
+        """
+        采用某个优化设计点（**L2 人决策**，需签发角色）。
+
+        未满足条件一律抛 ServiceError —— 这条路径上不存在"悄悄采用"。
+        真正的状态写入与审计交给 `optimization_loop.record_decision`
+        （它内部再调 `approval.record_optimize_decision` 落 decisions 表），
+        服务层只负责先给出可读的拒绝理由。
+        """
+        self.assert_can_adopt(session_id, point_id, role)
+        try:
+            return optloop_mod.record_decision(
+                self.conn, session_id, approval.DECISION_ADOPT, role=role,
+                operator=operator, rationale=rationale, point_id=point_id)
+        except optloop_mod.OptimizationLoopError as exc:
+            raise ServiceError(str(exc))
+        except approval.ApprovalError as exc:
+            raise ServiceError(str(exc))
+
+    def can_keep_original(self, session_id, role=None):
+        """
+        「维持原设计」的守卫：返回 ``(ok, reason)``。
+
+        与采用的区别：**不需要有可行点**（评估全失败时维持原设计正是稳妥收尾），
+        但仍需签发角色，且同样受"已定案不可改"约束。
+        """
+        try:
+            summary = self.get_optimization_summary(session_id)
+        except ServiceError as exc:
+            return False, str(exc)
+        if not summary.get("n_points"):
+            return False, "会话还没有任何设计点，无法决策（先跑优化）"
+        adoption = summary.get("adoption") or {}
+        if adoption.get("decided"):
+            return False, ("本会话已定案（%s），不可再改"
+                           % _decision_text(adoption.get("decision")))
+        if role is not None and role != OPTIMIZE_ROLE_SIGNER:
+            return False, ("角色「%s」无权决定是否采用优化方案（需要「%s」角色）"
+                           % (approval.role_name(role),
+                              approval.role_name(OPTIMIZE_ROLE_SIGNER)))
+        return True, ""
+
+    def assert_can_keep_original(self, session_id, role=None):
+        """维持原设计的前置断言。"""
+        ok, reason = self.can_keep_original(session_id, role)
+        if not ok:
+            raise ServiceError(reason)
+        return True
+
+    def keep_original_design(self, session_id, role=OPTIMIZE_ROLE_SIGNER,
+                             operator=None, rationale=None):
+        """
+        维持原设计（**一等决策**，不是"什么都不做"）。
+
+        评估全失败、或改进不足以抵消改型成本时，明确收尾比留着悬空更好。
+        同样落 L2 审计，同样受"已定案不可改"约束。
+        """
+        self.assert_can_keep_original(session_id, role)
+        try:
+            return optloop_mod.record_decision(
+                self.conn, session_id, approval.DECISION_KEEP_ORIGINAL,
+                role=role, operator=operator, rationale=rationale)
+        except optloop_mod.OptimizationLoopError as exc:
+            raise ServiceError(str(exc))
+        except approval.ApprovalError as exc:
+            raise ServiceError(str(exc))
+
+    def require_adopted_optimization(self, session_id):
+        """
+        取**已批准**采用的优化方案；未批准/维持原设计一律抛 ServiceError。
+
+        给"要把优化结论写进报告/下发生产"的调用方用：必须过这一关，
+        否则就是让优化器的建议冒充人的决定（ADR-0002 的 L2 门）。
+        """
+        try:
+            point = optloop_mod.require_adopted_point(self.conn, session_id)
+        except optloop_mod.OptimizationLoopError as exc:
+            raise ServiceError(str(exc))
+        point["label"] = optimize_point_label(point)
+        return point
+
+    def get_optimization_adoption(self, session_id):
+        """会话的采用状态快照（未批准时 decided=False / point_id=None）。"""
+        return self._optimization_adoption(session_id)
+
+    def get_optimization_decision_history(self, session_id):
+        """
+        优化方案的 L2 决策审计（谁、什么决定、什么理由、什么时候）。
+
+        直接读 decisions 表（票18 的审计表），并按会话过滤 —— 于是"当初谁批的、
+        批的是哪一点"是可查的事实，不是回忆。
+        """
+        return approval.optimize_decisions(self.conn, session_id=session_id)
+
+    # ---------------- 内部：优化相关的取数 helpers ----------------
+
+    def _optimization_adoption(self, session_id):
+        """采用状态快照（未登记时给"尚未批准"形态，不返回 None）。"""
+        try:
+            return optloop_mod.get_adoption(self.conn, session_id)
+        except optloop_mod.OptimizationLoopError as exc:
+            raise ServiceError(str(exc))
+
+    def _optimization_point(self, session_id, point_id):
+        """取会话内的一个设计点；不存在抛 ServiceError（含会话/点号）。"""
+        try:
+            points = optloop_mod.list_points(self.conn, session_id)
+        except optloop_mod.OptimizationLoopError as exc:
+            raise ServiceError(str(exc))
+        for p in points:
+            if p["point_id"] == point_id:
+                return p
+        raise ServiceError("设计点 #%s 不存在于优化会话 %s 里（该会话共有 %d 个设计点）"
+                           % (point_id, session_id, len(points)))
+
+    def _optimization_point_or_none(self, session_id, point_id):
+        """取设计点；取不到返回 None（对比视图容错用，不让 UI 崩）。"""
+        if point_id is None:
+            return None
+        try:
+            return self._optimization_point(session_id, point_id)
+        except ServiceError:
+            return None
+
 
 # ---------------------------------------------------------------------------
 # 审批工作台用到的常量与纯函数（无 UI 依赖，可单测）
@@ -933,6 +1473,180 @@ ROLE_ACTIONS = {
     approval.ROLE_DESIGN: (),
     approval.ROLE_ANALYSIS: (),
 }
+
+
+# ---------------------------------------------------------------------------
+# 优化汇总视图的可读渲染（票28；纯函数，不碰 DB，可单测）
+# ---------------------------------------------------------------------------
+
+def format_optimization_summary_text(summary):
+    """
+    优化汇总视图的可读渲染（UI 一页看完整次优化）。
+
+    结构上刻意把三组**分开列**：项目负责人要能一眼分清"设计不好"（不可行）
+    与"算不出来"（技术故障）—— 后者不是设计的错，而是环境/建模的错，处理方式完全不同。
+    """
+    counts = summary.get("counts") or {}
+    lines = ["优化会话 %s（%s）"
+             % (summary.get("session_id"),
+                summary.get("status_name") or summary.get("status") or "-")]
+    lines.append("  模板族 %s" % (summary.get("template_id") or "-"))
+
+    intent = summary.get("intent") or {}
+    obj = intent.get("objective") or {}
+    if obj:
+        lines.append("  优化目标：%s 最小化（%s）"
+                     % (obj.get("name"), obj.get("unit") or "-"))
+    for c in intent.get("constraints") or []:
+        lines.append("  约束：%s（require=%s，依据 %s）"
+                     % (c.get("name"), c.get("require"), c.get("source") or "-"))
+    budget = summary.get("budget") or {}
+    if budget:
+        lines.append("  预算：最多评估 %s 次 / %s 轮，改进阈值 %s"
+                     % (budget.get("max_evals"), budget.get("max_rounds"),
+                        budget.get("improvement_threshold")))
+
+    lines.append("  设计点 %d：可行 %s / 不可行 %s / 评估失败 %s"
+                 % (summary.get("n_points", 0),
+                    counts.get(optloop_mod.GROUP_FEASIBLE, 0),
+                    counts.get(optloop_mod.GROUP_INFEASIBLE, 0),
+                    counts.get(optloop_mod.GROUP_FAILED, 0)))
+    if summary.get("stop_text"):
+        lines.append("  停止原因：%s" % summary["stop_text"])
+
+    # ---- 三组分开列（"设计不好" vs "算不出来" 不能混在一起说）----
+    for group in (optloop_mod.GROUP_FEASIBLE, optloop_mod.GROUP_INFEASIBLE,
+                  optloop_mod.GROUP_FAILED):
+        items = (summary.get("groups") or {}).get(group) or []
+        name = OPTIMIZE_GROUP_NAMES.get(group, group)
+        lines.append("")
+        lines.append("【%s】%d 个" % (name, len(items)))
+        if not items:
+            lines.append("  （无）")
+            continue
+        for p in items:
+            lines.append("  " + (p.get("label") or optimize_point_label(p)))
+
+    # 评估失败的原因清单（"算不出来"要给出为什么）
+    reasons = summary.get("failed_reasons") or []
+    if reasons:
+        lines.append("")
+        lines.append("【评估失败原因】")
+        for r in reasons:
+            lines.append("  设计点 #%s [%s] %s"
+                         % (r.get("point_id"),
+                            r.get("kind_label") or r.get("kind") or "-",
+                            r.get("message") or "-"))
+
+    lines.append("")
+    best = summary.get("best")
+    if best:
+        lines.append("当前最优可行点：设计点 #%s，质量 %s kg"
+                     % (best.get("point_id"), _fmt_num(best.get("objective_value"))))
+    else:
+        lines.append("当前最优可行点：无（未找到满足约束的设计；"
+                     "此时「维持原设计」是稳妥选择）")
+
+    rec = summary.get("recommendation") or {}
+    lines.append("建议采用：%s" % (rec.get("text") or "-"))
+
+    adoption = summary.get("adoption") or {}
+    if adoption.get("decided"):
+        lines.append("采用决策：%s（%s，%s）%s"
+                     % (_decision_text(adoption.get("decision")),
+                        adoption.get("actor") or "-",
+                        adoption.get("at") or "-",
+                        ("— " + adoption["rationale"])
+                        if adoption.get("rationale") else ""))
+    else:
+        lines.append("采用决策：尚未批准（优化方案不可当作已采用，需 L2 人决策）")
+    return "\n".join(lines)
+
+
+def format_optimization_comparison_text(cmp):
+    """优化前后对比的可读渲染（质量降幅 + 最小 MS 变化）。"""
+    basis_text = {
+        "adopted": "已批准的采用方案",
+        "keep_original": "维持原设计（未改动）",
+        "best_feasible": "建议采用的方案（尚未批准）",
+        "none": "无可用设计点",
+    }.get(cmp.get("basis"), "-")
+
+    lines = ["优化前后对比（基线 = 设计向量默认值 = 当前设计）"]
+    before = cmp.get("before") or {}
+    after = cmp.get("after") or {}
+    if before:
+        lines.append("  优化前：设计点 #%s（%s），质量 %s kg，最小 MS %s"
+                     % (before.get("point_id"),
+                        OPTIMIZE_GROUP_NAMES.get(before.get("group_name"),
+                                                 before.get("group_name") or "-"),
+                        _fmt_num(cmp.get("mass_before")),
+                        _fmt_num(cmp.get("min_ms_before"))))
+    else:
+        lines.append("  优化前：（会话里没有基线点，无法对比）")
+    if after:
+        lines.append("  优化后：设计点 #%s（%s），质量 %s kg，最小 MS %s"
+                     % (after.get("point_id"), basis_text,
+                        _fmt_num(cmp.get("mass_after")),
+                        _fmt_num(cmp.get("min_ms_after"))))
+    else:
+        lines.append("  优化后：无（%s）" % basis_text)
+
+    delta = cmp.get("mass_delta")
+    pct = cmp.get("mass_reduction_pct")
+    if delta is not None:
+        lines.append("  质量变化：%s kg（降幅 %s）"
+                     % (_fmt_num(delta),
+                        ("%.2f%%" % pct) if pct is not None else "-"))
+    else:
+        lines.append("  质量变化：无法计算（缺少可比的目标值）")
+    ms_delta = cmp.get("min_ms_delta")
+    if ms_delta is not None:
+        lines.append("  最小 MS 变化：%s" % _fmt_num(ms_delta))
+    else:
+        lines.append("  最小 MS 变化：无法计算")
+    if cmp.get("basis") == "best_feasible":
+        lines.append("  ！「优化后」目前只是**建议**，尚未经人批准（L2）；"
+                     "采用后本对比会切换到已批准方案。")
+    return "\n".join(lines)
+
+
+def format_optimization_point_text(detail):
+    """设计点详情（设计向量 + 校核明细 + 血缘 + 失败原因）的可读渲染。"""
+    lines = ["设计点 #%s（会话 %s）"
+             % (detail.get("point_id"), detail.get("session_id"))]
+    if detail.get("study_id"):
+        lines.append("  关联 Study：%s" % detail["study_id"])
+    lines.append("  分组：%s　来源：%s%s"
+                 % (detail.get("group_label") or "-",
+                    detail.get("source") or "-",
+                    "　★当前最优" if detail.get("is_best") else ""))
+    if detail.get("reused_from"):
+        lines.append("  数模复用自：%s（纯铺层轮次，未再生数模）"
+                     % detail["reused_from"])
+    err = detail.get("error")
+    if err:
+        lines.append("  技术故障[%s] %s"
+                     % (OPTIMIZE_ERROR_KIND_NAMES.get(err.get("kind"),
+                                                      err.get("kind")),
+                        err.get("message")))
+    else:
+        lines.append("  质量 %s kg；最大 FI %s / 最小 MS %s"
+                     % (_fmt_num(detail.get("objective_value")),
+                        _fmt_num(_constraint_value(detail, "max_fi")),
+                        _fmt_num(_constraint_value(detail, "min_ms"))))
+    lines.append("")
+    lines.append("【设计向量】")
+    vec = detail.get("vector") or {}
+    for k in sorted(vec):
+        lines.append("  %-16s %s" % (k, vec[k]))
+    lines.append("")
+    lines.append("【校核结论】")
+    lines.append(detail.get("check_text") or "（无校核结论）")
+    lines.append("")
+    lines.append("【血缘】")
+    lines.append(detail.get("lineage_text") or "（无产物）")
+    return "\n".join(lines)
 
 
 def _json_loads(text, default=None):
