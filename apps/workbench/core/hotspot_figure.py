@@ -73,7 +73,8 @@ def draw_hotspot_figure(result, out_png, width=1100, height=700):
     hotspots = chk.get("hotspots") or []
     invalid_ids = set(chk.get("invalid_bays") or [])
 
-    margin_l, margin_r, margin_t, margin_b = 90, 40, 60, 70
+    # 边距：顶部留够标题+轴标签，底部留图例，左侧留刻度数字
+    margin_l, margin_r, margin_t, margin_b = 110, 50, 96, 96
     plot_w = width - margin_l - margin_r
     plot_h = height - margin_t - margin_b
 
@@ -153,18 +154,34 @@ def draw_hotspot_figure(result, out_png, width=1100, height=700):
                 d.ellipse([cx - 1.5, cyy - 1.5, cx + 1.5, cyy + 1.5],
                           fill=(120, 140, 160))
 
-    # ---- 坐标轴 ----
+    # ---- 坐标轴与刻度 ----
     d.rectangle([margin_l, margin_t, margin_l + plot_w, margin_t + plot_h],
                 outline=(80, 80, 80))
-    d.text((margin_l, margin_t - 26), "xi (弦向 0=前梁 → 1=后梁)",
-           fill=(40, 40, 40), font=f_label)
-    d.text((margin_l - 70, margin_t + plot_h + 18), "y (展向)",
-           fill=(40, 40, 40), font=f_label)
+
+    # 横向刻度：展向 y（从 y_min 到 y_max）
+    x0, y0 = px(y_min, xi_min)
+    x1, y1 = px(y_max, xi_max)
+    for k in range(6):
+        gx = x0 + (x1 - x0) * k / 5.0
+        val = y_min + (y_max - y_min) * k / 5.0
+        d.line([gx, y1, gx, y1 + 5], fill=(80, 80, 80))
+        d.text((gx - 16, y1 + 8), "%.2f" % val, fill=(60, 60, 60), font=f_small)
+    d.text((margin_l + plot_w / 2.0 - 70, y1 + 30),
+           "y 展向位置 (m)", fill=(40, 40, 40), font=f_label)
+
+    # 纵向刻度：弦向 xi（0=前梁, 1=后梁）
+    for k in range(6):
+        gy = y1 - (y1 - y0) * k / 5.0
+        val = xi_min + (xi_max - xi_min) * k / 5.0
+        d.line([x0 - 5, gy, x0, gy], fill=(80, 80, 80))
+        d.text((x0 - 42, gy - 7), "%.2f" % val, fill=(60, 60, 60), font=f_small)
+    d.text((margin_l - 4, margin_t - 26),
+           "xi 弦向（0=前梁 → 1=后梁）", fill=(40, 40, 40), font=f_label)
 
     # ---- 标题与图例 ----
     d.text((margin_l, 18), "危险部位分布（红色 = 危险部位，含 FI 标注）",
            fill=(20, 20, 20), font=f_title)
-    ly = height - 46
+    ly = height - 34
     d.ellipse([margin_l, ly, margin_l + 12, ly + 12], fill=(220, 40, 40))
     d.text((margin_l + 18, ly - 1), "危险部位", fill=(60, 60, 60), font=f_label)
     d.rectangle([margin_l + 120, ly, margin_l + 132, ly + 12],

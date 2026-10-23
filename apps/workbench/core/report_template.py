@@ -18,10 +18,33 @@ except ImportError:  # pragma: no cover
 
 
 # 全部占位符（模板生成器与渲染器共用，便于一致性测试）
+# 语法：{{key}}；点号表示命名空间（{{param.span}} / {{model.n_elems}}）
 PLACEHOLDERS = [
     "study_id",
+    "study_name",
     "generated_at",
     "template_id",
+    # 逐参数命名空间
+    "param.span",
+    "param.sweep_deg",
+    "param.c_root",
+    "param.c_tip",
+    "param.n_ribs",
+    "param.n_stringers",
+    # 模型信息命名空间
+    "model.n_bays_total",
+    "model.n_bays_valid",
+    "model.n_bays_invalid",
+    "model.n_elems",
+    "model.n_nodes",
+    "model.n_plies",
+    "model.total_thickness",
+    # 校核依据
+    "check.criteria",
+    "check.safety_factor",
+    "check.ms_threshold",
+    "check.allowables",
+    # 汇总
     "summary.max_fi",
     "summary.min_ms",
     "summary.all_pass",
@@ -29,12 +52,12 @@ PLACEHOLDERS = [
     "summary.n_detail_rows",
     "summary.n_bays_checked",
     "summary.n_bays_excluded",
-    "check.criteria",
-    "check.safety_factor",
-    "allowables",
+    # 结构化
     "param_table",
+    "detail_table",
     "hotspot_table",
     "invalid_bay_table",
+    "artifact_table",
     "hotspot_figure",
     "conclusion",
 ]
@@ -52,6 +75,8 @@ def build_standard_template(path):
     p = doc.add_paragraph()
     p.add_run("分析任务(Study)：").bold = True
     p.add_run("{{study_id}}")
+    p.add_run("    名称：")
+    p.add_run("{{study_name}}")
 
     p = doc.add_paragraph()
     p.add_run("模板：").bold = True
@@ -62,6 +87,37 @@ def build_standard_template(path):
     # 1 参数与模型
     doc.add_heading("1  参数与模型", level=1)
     doc.add_paragraph("{{param_table}}")
+    p = doc.add_paragraph()
+    p.add_run("展长 span = ").bold = True
+    p.add_run("{{param.span}}")
+    p.add_run(" m    后掠角 = ")
+    p.add_run("{{param.sweep_deg}}")
+    p.add_run(" deg")
+    p = doc.add_paragraph()
+    p.add_run("根弦长 = ").bold = True
+    p.add_run("{{param.c_root}}")
+    p.add_run(" m    尖弦长 = ")
+    p.add_run("{{param.c_tip}}")
+    p.add_run(" m    肋数 = ")
+    p.add_run("{{param.n_ribs}}")
+    p.add_run("    长桁数 = ")
+    p.add_run("{{param.n_stringers}}")
+    p = doc.add_paragraph()
+    p.add_run("自然格：候选 ").bold = True
+    p.add_run("{{model.n_bays_total}}")
+    p.add_run("，有效 ")
+    p.add_run("{{model.n_bays_valid}}")
+    p.add_run("，不连续 ")
+    p.add_run("{{model.n_bays_invalid}}")
+    p = doc.add_paragraph()
+    p.add_run("网格：节点 ").bold = True
+    p.add_run("{{model.n_nodes}}")
+    p.add_run("，单元 ")
+    p.add_run("{{model.n_elems}}")
+    p.add_run("    铺层数 ")
+    p.add_run("{{model.n_plies}}")
+    p.add_run("，总厚 ")
+    p.add_run("{{model.total_thickness}}")
 
     # 2 校核依据
     doc.add_heading("2  校核依据", level=1)
@@ -71,9 +127,11 @@ def build_standard_template(path):
     p = doc.add_paragraph()
     p.add_run("安全系数：").bold = True
     p.add_run("{{check.safety_factor}}")
+    p.add_run("    MS 阈值：")
+    p.add_run("{{check.ms_threshold}}")
     p = doc.add_paragraph()
     p.add_run("材料许用值：").bold = True
-    p.add_run("{{allowables}}")
+    p.add_run("{{check.allowables}}")
 
     # 3 校核结果汇总
     doc.add_heading("3  校核结果汇总", level=1)
@@ -97,6 +155,9 @@ def build_standard_template(path):
     p.add_run("总体判定：").bold = True
     p.add_run("{{summary.all_pass}}")
 
+    doc.add_heading("3.1  校核明细表（单元 × 铺层 × 准则）", level=2)
+    doc.add_paragraph("{{detail_table}}")
+
     # 4 危险部位
     doc.add_heading("4  危险部位", level=1)
     doc.add_paragraph("{{hotspot_table}}")
@@ -111,6 +172,10 @@ def build_standard_template(path):
     # 6 结论
     doc.add_heading("6  结论与建议", level=1)
     doc.add_paragraph("{{conclusion}}")
+
+    # 附录 可追溯性
+    doc.add_heading("附录  产物与指纹（可追溯性）", level=1)
+    doc.add_paragraph("{{artifact_table}}")
 
     doc.add_paragraph()
     p = doc.add_paragraph()

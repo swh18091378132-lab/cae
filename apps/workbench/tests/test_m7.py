@@ -78,19 +78,34 @@ def test_render(fails):
 
     ctx = {
         "study_id": "STUDY-X",
+        "study_name": "STUDY-X",
         "template_id": "wingbox_v1",
         "generated_at": "2026-01-01 00:00:00",
+        "param": {"span": 5.0, "sweep_deg": 10.0, "c_root": 1.0, "c_tip": 0.6,
+                  "n_ribs": 3, "n_stringers": 4},
+        "model": {"n_bays_total": 6, "n_bays_valid": 6, "n_bays_invalid": 0,
+                  "n_elems": 6, "n_nodes": 20, "n_plies": 2,
+                  "total_thickness": 0.2},
         "summary": {"max_fi": "0.5", "min_ms": "1.0", "all_pass": "合格",
                     "n_elems": 6, "n_detail_rows": 36,
                     "n_bays_checked": 6, "n_bays_excluded": 0},
-        "check": {"criteria": "tsai_wu", "safety_factor": "1.5"},
+        "check": {"criteria": "tsai_wu", "safety_factor": "1.5",
+                  "ms_threshold": "0", "allowables": "Xt=1500 MPa"},
         "allowables": "Xt=1500 MPa",
         "param_table": {"span": 5.0, "n_ribs": 3},
+        "detail_table": [
+            {"elem": 5, "sp": 2, "criterion": "tsai_wu", "FI": 0.9,
+             "MS": 0.11, "pass": True},
+        ],
         "hotspot_table": [
             {"elem": 5, "sp": 2, "criterion": "tsai_wu", "FI": 0.9, "MS": 0.11},
             {"elem": 3, "sp": 1, "criterion": "hashin", "FI": 0.7, "MS": 0.43},
         ],
         "invalid_bay_table": ["NB-r1-s0", "NB-r1-s1"],
+        "artifact_table": [
+            {"kind": "check_result", "version": 1,
+             "checksum": "abcdef123456", "uri": "check/check_summary.json"},
+        ],
         "hotspot_figure": None,
         "conclusion": "TEST-CONCLUSION",
     }
@@ -232,6 +247,116 @@ def test_full_chain_report(fails):
     conn.close()
 
 
+def _chain_ctx():
+    """造一个贴近 run_study 真实返回的 context（不跑全链，快）。"""
+    return report_mod.build_report_context({
+        "study_id": "S-CTX",
+        "template": "wingbox_v1",
+        "parameters": {"span": 12.34, "sweep_deg": 25.0, "c_root": 3.0,
+                       "c_tip": 1.2, "n_ribs": 6, "n_stringers": 7},
+        "topology": {"n_total": 30, "n_valid": 28, "n_invalid": 2,
+                     "invalid_ids": ["NB-r0-s1"]},
+        "fe": {"n_nodes": 517, "n_elems": 480, "n_plies": 8,
+               "total_thickness": 0.8},
+        "solve": {"job": "job1", "status": "COMPLETED"},
+        "check": {
+            "summary": {"max_fi": 0.8123456, "min_ms": 0.231, "all_pass": True,
+                        "n_elems": 480, "n_detail_rows": 3,
+                        "n_bays_checked": 28, "n_bays_excluded": 2,
+                        "criteria": ["tsai_wu"], "safety_factor": 1.5,
+                        "allowables": {"Xt": 1500, "Xc": 1200, "Yt": 50,
+                                       "Yc": 200, "S": 70}},
+            "hotspots": [{"elem": 101, "sp": 3, "criterion": "tsai_wu",
+                          "FI": 0.8123456, "MS": 0.231}],
+            "invalid_bays": ["NB-r0-s1"],
+            "detail_rows": [
+                {"elem": 101, "sp": 3, "criterion": "tsai_wu",
+                 "FI": 0.8123456, "MS": 0.231, "pass": True},
+                {"elem": 77, "sp": 1, "criterion": "hashin",
+                 "FI": 0.51, "MS": 0.96, "pass": True},
+                {"elem": 9, "sp": 2, "criterion": "max_stress",
+                 "FI": 0.4, "MS": 1.5, "pass": True},
+            ]},
+    })
+
+
+def test_placeholder_namespaces(fails):
+    """
+    票 07 指定的占位符语法：{{param.span}} / {{summary.max_fi}} /
+    {{check.criteria}} / {{model.*}}。逐参数与模型信息必须能灌进去。
+    """
+    tmp = _tmpdir("m7ns")
+    tpl = os.path.join(tmp, "t.docx")
+    report_template.build_standard_template(tpl)
+
+    # 标准模板自身就要带上这些占位符（用户替换时按此对照）
+    tpl_text = _doc_text(tpl)
+    for key in ("{{param.span}}", "{{param.n_ribs}}", "{{model.n_elems}}",
+                "{{model.n_bays_valid}}", "{{detail_table}}"):
+        if key not in tpl_text:
+            fails.append("标准模板缺少占位符 %s" % key)
+
+    ctx = _chain_ctx()
+    out = os.path.join(tmp, "r.docx")
+    rr = report_mod.render_report(ctx, tpl, out)
+    text = _doc_text(out)
+
+    if "12.34" not in text:
+        fails.append("{{param.span}} 未灌入（找不到 12.34）")
+    if "480" not in text:
+        fails.append("{{model.n_elems}} 未灌入（找不到 480）")
+    if rr.get("unresolved"):
+        fails.append("标准模板渲染后仍有未解析占位符: %s" % rr["unresolved"])
+
+
+def test_render_signature_with_study_id(fails):
+    """票 07 契约：render_report(study_id, context, template_path, out_path)。"""
+    tmp = _tmpdir("m7sig")
+    tpl = os.path.join(tmp, "t.docx")
+    report_template.build_standard_template(tpl)
+    out = os.path.join(tmp, "r.docx")
+
+    ctx = _chain_ctx()
+    rr = report_mod.render_report("S-SIG", ctx, tpl, out)
+    if not os.path.isfile(out):
+        fails.append("study_id 签名下报告未生成")
+        return
+    text = _doc_text(out)
+    if "S-SIG" not in text:
+        fails.append("study_id 实参未写入报告")
+    if rr.get("path") != out:
+        fails.append("study_id 签名下返回路径不符")
+
+
+def test_detail_table(fails):
+    """校核明细表：行数 = 明细行数（含表头 +1）。"""
+    tmp = _tmpdir("m7detail")
+    tpl = os.path.join(tmp, "t.docx")
+    report_template.build_standard_template(tpl)
+    out = os.path.join(tmp, "r.docx")
+
+    ctx = _chain_ctx()
+    n = len(ctx["detail_table"])
+    if n != 3:
+        fails.append("detail_table 应有 3 行，实际 %d" % n)
+    report_mod.render_report(ctx, tpl, out)
+
+    from docx import Document
+    doc = Document(out)
+    found = None
+    for t in doc.tables:
+        hdr = [c.text.strip() for c in t.rows[0].cells]
+        if "单元" in hdr and "准则" in hdr and "铺层" in hdr and "FI" in hdr:
+            if "序号" not in hdr:      # 区分危险部位表（带序号）
+                found = t
+                break
+    if found is None:
+        fails.append("未找到校核明细表（表头应含 单元/铺层/准则/FI）")
+    elif len(found.rows) - 1 != n:
+        fails.append("校核明细表行数 %d != 明细行数 %d"
+                     % (len(found.rows) - 1, n))
+
+
 def main():
     fails = []
     print("1. template ...")
@@ -244,6 +369,12 @@ def main():
     test_full_chain_report(fails)
     print("5. figure ...")
     test_figure(fails)
+    print("6. placeholder namespaces (param./model./detail) ...")
+    test_placeholder_namespaces(fails)
+    print("7. render_report(study_id, ...) signature ...")
+    test_render_signature_with_study_id(fails)
+    print("8. detail table ...")
+    test_detail_table(fails)
 
     if fails:
         print("FAILED:")

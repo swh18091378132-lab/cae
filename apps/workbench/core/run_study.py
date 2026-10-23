@@ -39,6 +39,16 @@ class StudyRunError(Exception):
     pass
 
 
+def _study_name(study_id, conn):
+    """取 Study 名称；查不到则退回 id（报告标题栏用）。"""
+    try:
+        row = conn.execute("SELECT name FROM studies WHERE id=?",
+                           (study_id,)).fetchone()
+        return row["name"] if row is not None else study_id
+    except Exception:
+        return study_id
+
+
 def run_study(study_id, parameter_set, template_id, catia, conn,
               params_dir=None, templates_dir=None, topo_dir=None,
               holes=None, stringer_runout=None, partial_ribs=None,
@@ -94,6 +104,7 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
 
     result = {
         "study_id": study_id,
+        "study_name": _study_name(study_id, conn),
         "template": tpl.id,
         "parameters": params,
         "artifacts": {"parameter_set": ps_id, "catpart": cat_id},
@@ -286,6 +297,8 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             "summary": chk["summary"],
             "hotspots": chk["hotspots"],
             "invalid_bays": chk["invalid_bays"],
+            # 明细行供报告"校核明细表"使用（票 07）
+            "detail_rows": chk["detail_rows"],
         }
 
     # 8) 强度校核报告（票 07）
@@ -317,11 +330,22 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             fig_warnings.append("危险部位图生成失败: %s" % exc)
             result["hotspot_figure"] = None
 
+        # 先把已有产物的版本/指纹收进 result，供报告"可追溯性"附录表使用
+        meta = result.setdefault("artifact_meta", {})
+        for kind, aid in list(result["artifacts"].items()):
+            row = conn.execute(
+                "SELECT version, checksum, content_uri FROM artifacts WHERE id=?",
+                (aid,)).fetchone()
+            if row is not None:
+                meta[kind] = {"version": row["version"],
+                              "checksum": row["checksum"],
+                              "uri": row["content_uri"] or ""}
+
         # 渲染
         ctx = report_mod.build_report_context(result)
         out_path = report_out or os.path.join(rdir, "strength_report.docx")
         try:
-            rr = report_mod.render_report(ctx, tpl_path, out_path)
+            rr = report_mod.render_report(study_id, ctx, tpl_path, out_path)
         except Exception as exc:
             raise StudyRunError("报告渲染失败: %s" % exc)
 

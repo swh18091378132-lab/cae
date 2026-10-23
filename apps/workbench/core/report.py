@@ -29,7 +29,8 @@ from criteria import DEFAULT_ALLOWABLES
 
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
 
-TABLE_PLACEHOLDERS = ("param_table", "hotspot_table", "invalid_bay_table")
+TABLE_PLACEHOLDERS = ("param_table", "detail_table", "hotspot_table",
+                      "invalid_bay_table", "artifact_table")
 IMAGE_PLACEHOLDERS = ("hotspot_figure",)
 
 
@@ -42,12 +43,22 @@ def build_report_context(result, generated_at=None):
     从 run_study 的返回 dict 构造报告 context。
 
     result: run_study 返回值（需含 parameters / check / topology 等）
+
+    占位符命名空间（与票 07 约定一致）：
+      {{study_id}} {{study_name}} {{template_id}} {{generated_at}}
+      {{param.span}} {{param.n_ribs}} ...        逐参数
+      {{model.n_elems}} {{model.n_nodes}} ...    网格/铺层/自然格规模
+      {{check.criteria}} {{check.safety_factor}} {{check.allowables}} ...
+      {{summary.max_fi}} {{summary.all_pass}} ...
+      结构化：{{param_table}} {{detail_table}} {{hotspot_table}}
+             {{invalid_bay_table}} {{artifact_table}} {{hotspot_figure}}
     """
     chk = result.get("check") or {}
     summ = chk.get("summary") or {}
     params = result.get("parameters") or {}
     topo = result.get("topology") or {}
     fe = result.get("fe") or {}
+    solve = result.get("solve") or {}
 
     allow = summ.get("allowables") or DEFAULT_ALLOWABLES
     allow_txt = ("Xt=%g, Xc=%g, Yt=%g, Yc=%g, S=%g MPa"
@@ -77,12 +88,31 @@ def build_report_context(result, generated_at=None):
 
     hotspots = chk.get("hotspots") or []
     invalid_bays = chk.get("invalid_bays") or []
+    detail_rows = chk.get("detail_rows") or []
 
     ctx = {
         "study_id": result.get("study_id", ""),
+        "study_name": result.get("study_name") or result.get("study_id", ""),
         "template_id": result.get("template", ""),
         "generated_at": generated_at or datetime.datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"),
+
+        # 逐参数命名空间：{{param.span}}
+        "param": dict(params),
+
+        # 模型信息命名空间：{{model.n_elems}}
+        "model": {
+            "n_bays_total": topo.get("n_total", 0),
+            "n_bays_valid": topo.get("n_valid", 0),
+            "n_bays_invalid": topo.get("n_invalid", 0),
+            "n_elems": fe.get("n_elems", 0),
+            "n_nodes": fe.get("n_nodes", 0),
+            "n_plies": fe.get("n_plies", 0),
+            "total_thickness": fe.get("total_thickness", 0),
+            "job": solve.get("job", ""),
+            "status": solve.get("status", ""),
+        },
+
         "summary": {
             "max_fi": _fmt(max_fi),
             "min_ms": _fmt(min_ms),
@@ -92,22 +122,45 @@ def build_report_context(result, generated_at=None):
             "n_detail_rows": summ.get("n_detail_rows", 0),
             "n_bays_checked": summ.get("n_bays_checked", 0),
             "n_bays_excluded": summ.get("n_bays_excluded", 0),
+            "n_fail_rows": summ.get("n_fail_rows", 0),
         },
         "check": {
             "criteria": "、".join(crit) if crit else "（未指定）",
             "safety_factor": _fmt(summ.get("safety_factor")),
+            "ms_threshold": _fmt(summ.get("ms_threshold")),
+            "allowables": allow_txt,
+            "rules_checksum": summ.get("rules_checksum", ""),
         },
-        "allowables": allow_txt,
+
+        # 结构化（表格/图片）
         "param_table": params,
+        "detail_table": detail_rows,
         "hotspot_table": hotspots,
         "invalid_bay_table": invalid_bays,
+        "artifact_table": _artifact_rows(result),
         "hotspot_figure": result.get("hotspot_figure"),
         "conclusion": conclusion,
-        # 附带便于自定义模板使用
-        "_topology": topo,
-        "_fe": fe,
+
+        # 兼容旧模板的顶层别名（{{allowables}} 等）
+        "allowables": allow_txt,
     }
     return ctx
+
+
+def _artifact_rows(result):
+    """把 result['artifacts'] 整理成可追溯的清单（kind/version/checksum）。"""
+    arts = result.get("artifacts") or {}
+    meta = result.get("artifact_meta") or {}
+    rows = []
+    for kind in sorted(arts.keys()):
+        info = meta.get(kind) or {}
+        rows.append({
+            "kind": kind,
+            "version": info.get("version", ""),
+            "checksum": (info.get("checksum") or "")[:12],
+            "uri": info.get("uri", ""),
+        })
+    return rows
 
 
 def _fmt(v):
@@ -134,10 +187,28 @@ def _lookup(ctx, key):
 # 渲染
 # ---------------------------------------------------------------------------
 
-def render_report(context, template_path, out_path):
+def render_report(*args, **kwargs):
     """
-    渲染报告。返回 {'path':..., 'warnings':[...], 'replaced': n}
+    渲染报告。返回 {'path':..., 'warnings':[...], 'replaced': n, 'unresolved':[...]}
+
+    支持两种调用形式（票 07 约定的在前）：
+        render_report(study_id, context, template_path, out_path)
+        render_report(context, template_path, out_path)      # 兼容旧调用
     """
+    if len(args) >= 4:
+        study_id, context, template_path, out_path = args[:4]
+    elif len(args) == 3:
+        study_id = kwargs.pop("study_id", None)
+        context, template_path, out_path = args
+    else:
+        raise TypeError("render_report 需要 (study_id, context, template_path, out_path)"
+                        " 或 (context, template_path, out_path)")
+
+    if study_id:
+        # 显式 study_id 优先（追溯：报告必须能对上具体 Study 版本）
+        context = dict(context)
+        context["study_id"] = study_id
+
     if Document is None:
         raise RuntimeError("python-docx 未安装，无法渲染报告")
     if not os.path.isfile(template_path):
@@ -149,7 +220,7 @@ def render_report(context, template_path, out_path):
 
     # ---- 1) 段落级：文本占位符 + 表格/图片占位符 ----
     for para in list(doc.paragraphs):
-        _process_paragraph(doc, para, context, warnings)
+        replaced += _process_paragraph(doc, para, context, warnings)
 
     # ---- 2) 表格内文本占位符 ----
     for table in doc.tables:
@@ -158,13 +229,17 @@ def render_report(context, template_path, out_path):
                 for para in cell.paragraphs:
                     replaced += _replace_text_in_para(para, context, warnings)
 
-    # 统计未替换的（正文里仍残留的）
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+
     doc.save(out_path)
-    return {"path": out_path, "warnings": warnings,
+    return {"path": out_path, "warnings": warnings, "replaced": replaced,
             "unresolved": _scan_unresolved(out_path)}
 
 
 def _process_paragraph(doc, para, context, warnings):
+    """处理一个段落：图片占位符 > 表格占位符 > 文本占位符。返回替换数。"""
     text = para.text or ""
 
     # 图片占位符
@@ -183,7 +258,7 @@ def _process_paragraph(doc, para, context, warnings):
                 warnings.append("图片占位符 %s 无可用图片（%r）" % (key, img))
                 _clear_para(para)
                 para.add_run("[图缺失: %s]" % key)
-            return
+            return 1
 
     # 表格占位符
     for key in TABLE_PLACEHOLDERS:
@@ -191,10 +266,10 @@ def _process_paragraph(doc, para, context, warnings):
             data = _lookup(context, key)
             _clear_para(para)
             _insert_table_at(doc, para, key, data, warnings)
-            return
+            return 1
 
     # 纯文本占位符
-    _replace_text_in_para(para, context, warnings)
+    return _replace_text_in_para(para, context, warnings)
 
 
 def _replace_text_in_para(para, context, warnings):
@@ -250,6 +325,21 @@ def _insert_table_at(doc, para, key, data, warnings):
             rows.append((str(i), str(h.get("elem")),
                          str(h.get("sp")), str(h.get("criterion")),
                          _fmt(h.get("FI")), _fmt(h.get("MS"))))
+    elif key == "detail_table":
+        # 校核明细表（单元 × 铺层 × 准则），FI 降序便于审阅
+        rows = [("单元", "铺层", "准则", "FI", "MS", "判定")]
+        items = sorted(data or [], key=lambda r: -(r.get("FI") or 0.0))
+        for r in items:
+            rows.append((str(r.get("elem")), str(r.get("sp")),
+                         str(r.get("criterion")),
+                         _fmt(r.get("FI")), _fmt(r.get("MS")),
+                         "合格" if r.get("pass") else "不合格"))
+    elif key == "artifact_table":
+        # 产物与指纹清单：报告内容可追溯到具体版本
+        rows = [("产物", "版本", "指纹(sha256)", "位置")]
+        for a in (data or []):
+            rows.append((str(a.get("kind")), str(a.get("version")),
+                         str(a.get("checksum")), str(a.get("uri"))))
     elif key == "invalid_bay_table":
         rows = [("不连续格 ID", "说明")]
         for bid in (data or []):
