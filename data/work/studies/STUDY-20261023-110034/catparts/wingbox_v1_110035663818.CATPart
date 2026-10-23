@@ -1,0 +1,8 @@
+# FAKE CATPart (test stub)
+template=wingbox_v1
+c_root=3.0
+c_tip=1.2
+n_ribs=6
+n_stringers=7
+span=12.0
+sweep_deg=25.0

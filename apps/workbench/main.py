@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-main.py -- 本地工作台 CLI 骨架（M0）
+main.py -- 本地工作台 CLI
 
 用法（在 E:\\cae\\apps\\workbench 下）:
-    python main.py demo        # 建一个演示 Study，串起 M1..M6 的产物链，打印血缘
-    python main.py list        # 列出所有 Study
-    python main.py lineage <study_id>
-
-注意: P1 目标机为 Win7 + Python 3.8。本骨架只做数据/血缘层，不触发 CATIA/Abaqus。
+    python main.py demo          # 建演示 Study(仅血缘骨架)
+    python main.py list          # 列出所有 Study
+    python main.py lineage <id>  # 打印某 Study 的血缘
+    python main.py run [模板] [--real]   # 一条命令跑完 P1 全链(含报告)
+    python main.py ui [--real]           # 启动 Tkinter 工作台
 """
 
 import os
 import sys
+import json
 
 # 让 core 可作为包导入
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -85,6 +86,43 @@ def cmd_lineage(sid):
     print_lineage(sid)
 
 
+def cmd_run(template_id, mode="fake"):
+    """一条命令跑完整个 P1 链（票 08）。"""
+    from workbench_service import WorkbenchService
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(here))
+    work_root = os.path.join(repo, "data", "work")
+    svc = WorkbenchService(work_root, mode=mode)
+    try:
+        tpl = svc.get_template(template_id)
+        params = dict((p["name"], p.get("default")) for p in tpl.parameters)
+        sid = svc.start_study("CLI 分析 %s" % template_id)
+        print("Study: %s   模板: %s   模式: %s" % (sid, template_id, mode))
+        print("参数: %s" % json.dumps(params, ensure_ascii=False, sort_keys=True))
+        res = svc.run_chain(sid, params, template_id)
+        print()
+        print(svc.format_lineage_text(sid))
+        chk = res.get("check") or {}
+        print()
+        print("校核汇总: %s" % json.dumps(chk.get("summary") or {},
+                                        ensure_ascii=False, sort_keys=True))
+        rep = res.get("report") or {}
+        print("报告: %s" % rep.get("path"))
+        if rep.get("warnings"):
+            for w in rep["warnings"]:
+                print("  [warn] %s" % w)
+        return 0
+    finally:
+        svc.close()
+
+
+def cmd_ui(mode="fake"):
+    """启动 Tkinter 工作台（票 08）。"""
+    import ui_workbench
+    return ui_workbench.launch(mode=mode)
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args or args[0] == "demo":
@@ -93,6 +131,13 @@ if __name__ == "__main__":
         cmd_list()
     elif args[0] == "lineage" and len(args) >= 2:
         cmd_lineage(args[1])
+    elif args[0] == "run":
+        tpl = args[1] if len(args) >= 2 else "wingbox_v1"
+        mode = "real" if "--real" in args else "fake"
+        sys.exit(cmd_run(tpl, mode))
+    elif args[0] == "ui":
+        mode = "real" if "--real" in args else "fake"
+        sys.exit(cmd_ui(mode))
     else:
         print(__doc__)
         sys.exit(2)
