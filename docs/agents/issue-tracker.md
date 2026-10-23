@@ -2,6 +2,13 @@
 
 Issues and specs for this repo live as markdown files in `.scratch/`.
 
+> **Why local, even though there is a GitHub remote:** this tracker was chosen when
+> `E:\cae` had no remote. It was later kept local because the `gh` CLI is not
+> authenticated on the target machine. Tickets are committed and pushed with the
+> code, so they are versioned and shared — they are simply repo files rather than
+> GitHub Issues. Switching to GitHub Issues later only requires `gh auth login`
+> plus re-publishing `.scratch/*/issues/*.md` as issues.
+
 ## Conventions
 
 - One feature per directory: `.scratch/<feature-slug>/`

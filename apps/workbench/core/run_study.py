@@ -5,7 +5,8 @@ run_study.py -- Study 编排器（唯一主测试切口）
 已接入:
   M1(票02)：参数集 -> 参数契约/包络校验 -> CATIA 再生数模 -> 血缘
   M2(票03)：数模 -> 结构拓扑模型 -> 自然格 + 不连续格 -> 血缘
-后续票 04-07 将在此继续接入 网格/求解/抽取/校核/报告，接口保持向后兼容。
+  M3(票04)：拓扑 -> 网格(与自然格对齐) -> 铺层(CAE 属性)+载荷/BC -> .inp -> 血缘
+后续票 05-07 将在此继续接入 求解/抽取/校核/报告，接口保持向后兼容。
 
 兼容 Python 3.8。
 """
@@ -15,10 +16,12 @@ import os
 try:
     from . import template_registry
     from . import topology
+    from . import fe_model
     from .study import add_artifact, link
 except ImportError:
     import template_registry
     import topology
+    import fe_model
     from study import add_artifact, link
 
 
@@ -29,7 +32,9 @@ class StudyRunError(Exception):
 def run_study(study_id, parameter_set, template_id, catia, conn,
               params_dir=None, templates_dir=None, topo_dir=None,
               holes=None, stringer_runout=None, partial_ribs=None,
-              with_topology=True):
+              with_topology=True, with_fe_model=False, fe_dir=None,
+              subdiv_per_bay=4, plies=None, material=None,
+              step=None, load=None):
     """
     执行一次 Study。返回 dict 汇总。
 
@@ -112,5 +117,47 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             "invalid_ids": [b.id for b in model.invalid_bays],
         }
         result["topology_model"] = model
+
+    # 5) FE 模型构建 -> 网格 + 铺层 + 载荷/BC -> .inp（票 04）
+    if with_fe_model:
+        if not with_topology:
+            raise StudyRunError("构建 FE 模型需要先启用 with_topology")
+        try:
+            fe = fe_model.build_fe_model(
+                model, fe_dir or (os.path.join(params_dir, "fe") if params_dir else "fe"),
+                subdiv_per_bay=subdiv_per_bay, plies=plies,
+                material=material, step=step, load=load)
+        except Exception as exc:
+            raise StudyRunError("FE 模型构建失败: %s" % exc)
+
+        mesh_id = add_artifact(
+            study_id, "mesh", content_uri=fe.inp_path,
+            params={"n_nodes": fe.mesh_dict["n_nodes"],
+                    "n_elems": fe.mesh_dict["n_elems"],
+                    "subdiv_per_bay": subdiv_per_bay,
+                    "n_bays": len(model.bays)},
+            conn=conn)
+        link(result["artifacts"]["topology"], mesh_id, conn=conn)
+
+        inp_id = add_artifact(
+            study_id, "inp", content_uri=fe.inp_path,
+            params={"step": fe.step.get("name"),
+                    "step_type": fe.step.get("type"),
+                    "n_plies": fe.laminate["n_plies"],
+                    "total_thickness": fe.laminate["total_thickness"],
+                    "load": fe.load},
+            conn=conn)
+        link(mesh_id, inp_id, conn=conn)
+
+        result["artifacts"]["mesh"] = mesh_id
+        result["artifacts"]["inp"] = inp_id
+        result["fe"] = {
+            "n_nodes": fe.mesh_dict["n_nodes"],
+            "n_elems": fe.mesh_dict["n_elems"],
+            "n_plies": fe.laminate["n_plies"],
+            "total_thickness": fe.laminate["total_thickness"],
+            "inp_path": fe.inp_path,
+        }
+        result["fe_model"] = fe
 
     return result
