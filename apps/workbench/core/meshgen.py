@@ -84,19 +84,27 @@ class Mesh(object):
         }
 
 
-def build_mesh(model, subdiv_per_bay=4):
+def build_mesh(model, subdiv_per_bay=4, subdiv_by_bay=None):
     """
-    由 TopologyModel 生成网格：每个自然格独立划 subdiv_per_bay x subdiv_per_bay，
+    由 TopologyModel 生成网格：每个自然格独立划 subdiv × subdiv，
     相邻格共边复用节点，因此**不存在跨自然格边界的单元**。
 
-    model: topology.TopologyModel
+    model          : topology.TopologyModel
+    subdiv_per_bay : 全局默认每格每方向细分数（P1 口径）
+    subdiv_by_bay  : 可选 {bay_id: n} 逐格覆盖（票15 自动加密用）；
+                     未列出的格沿用 subdiv_per_bay
+
     返回 Mesh
     """
     mesh = Mesh()
+    per_bay = subdiv_by_bay or {}
     order = sorted(model.bays, key=lambda b: (b.rib_j, b.str_i))
     for bay in order:
+        n = int(per_bay.get(bay.id, subdiv_per_bay))
+        if n < 1:
+            n = 1
         mesh.add_quad(bay.y0, bay.y1, bay.xi0, bay.xi1,
-                      bay.id, bay.valid, subdiv_per_bay, subdiv_per_bay)
+                      bay.id, bay.valid, n, n)
     return mesh
 
 

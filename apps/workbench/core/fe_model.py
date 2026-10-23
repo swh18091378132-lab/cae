@@ -21,13 +21,18 @@ except ImportError:
 
 
 class FeModel(object):
-    def __init__(self, mesh, mesh_dict, inp_path, laminate, step, load):
+    def __init__(self, mesh, mesh_dict, inp_path, laminate, step, load,
+                 analysis=None, mesh_quality=None):
         self.mesh = mesh
         self.mesh_dict = mesh_dict
         self.inp_path = inp_path
         self.laminate = laminate
         self.step = step
         self.load = load
+        # 票14：本模型所用分析类型声明（None = P1 静力默认）
+        self.analysis = analysis
+        # 票15：网格质量报告（None = 未启用质量门）
+        self.mesh_quality = mesh_quality
 
 
 def _import_fe_build():
@@ -60,7 +65,18 @@ def build_fe_model(topology_model, out_dir, subdiv_per_bay=4,
     """
     fb = _import_fe_build()
 
+    quality = None
     mesh = meshgen.build_mesh(topology_model, subdiv_per_bay=subdiv_per_bay)
+
+    # 票15：网格质量门 —— 评估 + 超标格自动加密，且加密后仍不得跨界（ADR-0010）
+    if mesh_quality:
+        try:
+            from . import mesh_quality as mq_mod
+        except ImportError:
+            import mesh_quality as mq_mod
+        quality = mq_mod.apply_gate(topology_model, mesh, mesh_quality)
+        mesh = quality["mesh"]
+
     ok, problems = meshgen.verify_no_straddle(topology_model, mesh)
     if not ok:
         raise ValueError("网格与自然格未对齐(ADR-0010): %s" % problems[:3])
@@ -81,4 +97,5 @@ def build_fe_model(topology_model, out_dir, subdiv_per_bay=4,
                  laminate, mat, st, ld, {}, topology_model.params,
                  topology_model.extents(), analysis)
 
-    return FeModel(mesh, mesh.to_dict(), inp_path, laminate, st, ld)
+    return FeModel(mesh, mesh.to_dict(), inp_path, laminate, st, ld,
+                   analysis=analysis, mesh_quality=quality)
