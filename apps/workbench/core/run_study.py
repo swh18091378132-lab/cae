@@ -208,6 +208,41 @@ class RunOptions(object):
                                 % type(options).__name__)
         return base.replace(**(legacy or {}))
 
+    @classmethod
+    def full_chain(cls, dir_for, plies=None, rules=None, load=None,
+                   subdiv_per_bay=1, with_report=True, abaqus=None,
+                   templates_dir=None):
+        """
+        「跑完整链」的标准选项：各阶段目录 + 全阶段开关。
+
+        `dir_for(sub)` 由调用方提供（服务工作台用 studies/<id>/<sub>，
+        型号批量用同一个约定）。集中在这里的理由：服务的 run_chain 与型号批量
+        都要铺这一长串字段，**加一个新阶段只该改这一处**，而不是两处各改一遍
+        （首轮实现就是复制了两份，code-review 的 Shotgun Surgery 项）。
+
+        返回的 RunOptions 里所有字段都是显式设置过的，可直接 overlay 调用方的选项。
+        """
+        return cls(
+            params_dir=dir_for("params"),
+            topo_dir=dir_for("topo"),
+            templates_dir=templates_dir,
+            with_topology=True,
+            with_fe_model=True,
+            fe_dir=dir_for("fe"),
+            subdiv_per_bay=subdiv_per_bay,
+            plies=plies or [{"angle": 0.0, "thickness": 0.1},
+                            {"angle": 90.0, "thickness": 0.1}],
+            load=load,
+            abaqus=abaqus,
+            with_solve=True,
+            job_name="job1",
+            solve_dir=dir_for("solve"),
+            with_check=True,
+            check_dir=dir_for("check"),
+            rules=rules or {"criteria": ["tsai_wu", "hashin"]},
+            with_report=with_report,
+            report_dir=dir_for("report"))
+
 
 def _normalize_analysis(analysis):
     """

@@ -60,6 +60,7 @@ try:
     from . import model_config as mc
     from . import approval
     from . import study as study_mod
+    from . import textfmt
     from .run_study import RunOptions, run_study
     from .catia_driver import FakeCatiaDriver
     from .abaqus_runner import FakeAbaqusRunner
@@ -67,6 +68,7 @@ except ImportError:  # 允许作为脚本/在 core 目录内直接运行
     import model_config as mc
     import approval
     import study as study_mod
+    import textfmt
     from run_study import RunOptions, run_study
     from catia_driver import FakeCatiaDriver
     from abaqus_runner import FakeAbaqusRunner
@@ -117,12 +119,8 @@ def _now():
 
 
 def _json_loads(text, default=None):
-    if text is None:
-        return default
-    try:
-        return json.loads(text)
-    except (ValueError, TypeError):
-        return default
+    """宽松 JSON 解析（实现在 core/textfmt，与服务层共用一份）。"""
+    return textfmt.json_loads(text, default)
 
 
 def _as_options(value):
@@ -267,25 +265,12 @@ class DirectRunner(ModelRunner):
             "abaqus", study_id,
             lambda: FakeAbaqusRunner(n_elems=6, n_plies=2))
 
-        base = RunOptions(
+        # 各阶段目录与开关集中在 RunOptions.full_chain（加新阶段只改那一处）
+        base = RunOptions.full_chain(
+            lambda sub: self._dir(study_id, sub),
             templates_dir=self.templates_dir,
-            params_dir=self._dir(study_id, "params"),
-            topo_dir=self._dir(study_id, "topo"),
-            with_topology=True,
-            with_fe_model=True,
-            fe_dir=self._dir(study_id, "fe"),
-            plies=[{"angle": 0.0, "thickness": 0.1},
-                   {"angle": 90.0, "thickness": 0.1}],
-            load=None,
-            abaqus=abaqus,
-            with_solve=True,
-            job_name="job1",
-            solve_dir=self._dir(study_id, "solve"),
-            with_check=True,
-            check_dir=self._dir(study_id, "check"),
-            rules={"criteria": ["tsai_wu", "hashin"]},
-            with_report=True,
-            report_dir=self._dir(study_id, "report"))
+            subdiv_per_bay=1,
+            abaqus=abaqus)
 
         result = run_study(study_id, params, template_id, catia,
                            self.conn, options=base.overlay(options))
@@ -883,18 +868,13 @@ def get_part_rollup(conn, model_id, part_key):
 # ---------------------------------------------------------------------------
 
 def _fmt_num(value, fmt="%.4f"):
-    if value is None:
-        return "-"
-    try:
-        return fmt % float(value)
-    except (TypeError, ValueError):
-        return str(value)
+    """数值格式化（实现在 core/textfmt，与服务层共用一份）。"""
+    return textfmt.fmt_num(value, fmt)
 
 
 def _fmt_verdict(passed):
-    if passed is None:
-        return "无结论"
-    return "合格" if passed else "不合格"
+    """合格判定文案（实现在 core/textfmt）。"""
+    return textfmt.fmt_verdict(passed)
 
 
 def format_rollup_text(result):

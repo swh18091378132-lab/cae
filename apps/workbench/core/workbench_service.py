@@ -24,6 +24,7 @@ try:
     from . import approval
     from . import model_config as model_config_mod
     from . import model_rollup as rollup_mod
+    from . import textfmt
     from .catia_driver import FakeCatiaDriver, RealCatiaDriver
     from .abaqus_runner import FakeAbaqusRunner, RealAbaqusRunner
 except ImportError:
@@ -35,6 +36,7 @@ except ImportError:
     import approval
     import model_config as model_config_mod
     import model_rollup as rollup_mod
+    import textfmt
     from catia_driver import FakeCatiaDriver, RealCatiaDriver
     from abaqus_runner import FakeAbaqusRunner, RealAbaqusRunner
 
@@ -138,24 +140,12 @@ class WorkbenchService(object):
                           {"angle": 90.0, "thickness": 0.1}]
         rules = rules or {"criteria": ["tsai_wu", "hashin"]}
 
-        base = rs_mod.RunOptions(
-            params_dir=self._dir(study_id, "params"),
-            topo_dir=self._dir(study_id, "topo"),
-            with_topology=True,
-            with_fe_model=True,
-            fe_dir=self._dir(study_id, "fe"),
-            subdiv_per_bay=subdiv_per_bay,
-            plies=plies,
-            load=load,
-            abaqus=self._abaqus(),
-            with_solve=True,
-            job_name="job1",
-            solve_dir=self._dir(study_id, "solve"),
-            with_check=True,
-            check_dir=self._dir(study_id, "check"),
-            rules=rules,
-            with_report=with_report,
-            report_dir=self._dir(study_id, "report"))
+        # 各阶段目录与开关集中在 RunOptions.full_chain（加新阶段只改那一处）
+        base = rs_mod.RunOptions.full_chain(
+            lambda sub: self._dir(study_id, sub),
+            plies=plies, rules=rules, load=load,
+            subdiv_per_bay=subdiv_per_bay, with_report=with_report,
+            abaqus=self._abaqus())
 
         # 运行开始前先把该 Study 标成「分析中」（票18 状态机起点 / spec 用户故事 26）。
         # 这样项目负责人在型号汇总里看到的是"分析中"，而不是"未提交审批"
@@ -946,12 +936,8 @@ ROLE_ACTIONS = {
 
 
 def _json_loads(text, default=None):
-    if text is None:
-        return default
-    try:
-        return json.loads(text)
-    except (ValueError, TypeError):
-        return default
+    """宽松 JSON 解析（实现在 core/textfmt，与 model_rollup 共用一份）。"""
+    return textfmt.json_loads(text, default)
 
 
 def _as_float(value):
@@ -981,18 +967,13 @@ def _read_csv_head(path, n):
 
 
 def _fmt_num(value, fmt="%.4f"):
-    if value is None:
-        return "-"
-    try:
-        return fmt % float(value)
-    except (TypeError, ValueError):
-        return str(value)
+    """数值格式化（实现在 core/textfmt，与 model_rollup 共用一份）。"""
+    return textfmt.fmt_num(value, fmt)
 
 
 def _fmt_verdict(passed):
-    if passed is None:
-        return "无结论"
-    return "合格" if passed else "不合格"
+    """合格判定文案（实现在 core/textfmt）。"""
+    return textfmt.fmt_verdict(passed)
 
 
 def format_check_detail_text(detail):
