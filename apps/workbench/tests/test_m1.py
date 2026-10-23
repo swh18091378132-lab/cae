@@ -98,6 +98,18 @@ def main():
     if n != 1:
         fails.append("lineage edge parameter_set->catpart missing")
 
+    # 拓扑产物已生成，且血缘 catpart->topology 正确（票 03 接入）
+    tp = res["artifacts"].get("topology")
+    if tp is None:
+        fails.append("topology artifact not created by run_study")
+    else:
+        n = conn.execute("SELECT COUNT(*) c FROM edges WHERE parent_id=? AND child_id=?",
+                         (ct, tp)).fetchone()["c"]
+        if n != 1:
+            fails.append("lineage edge catpart->topology missing")
+        if res["topology"]["n_total"] != 30 or res["topology"]["n_invalid"] != 0:
+            fails.append("topology summary wrong: %r" % res["topology"])
+
     # --- 重跑：新增版本，不覆盖 ---
     res2 = run_study.run_study(
         "S-M1",

@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-run_study.py -- Study 编排器（唯一主测试切口，M1 版本）
+run_study.py -- Study 编排器（唯一主测试切口）
 
-M1 范围：参数集 -> (参数契约/包络校验) -> CATIA 再生 -> 记录血缘。
-后续 M2-M6 将在此逐步接入 拓扑/网格/求解/抽取/校核/报告，接口保持向后兼容。
+已接入:
+  M1(票02)：参数集 -> 参数契约/包络校验 -> CATIA 再生数模 -> 血缘
+  M2(票03)：数模 -> 结构拓扑模型 -> 自然格 + 不连续格 -> 血缘
+后续票 04-07 将在此继续接入 网格/求解/抽取/校核/报告，接口保持向后兼容。
 
 兼容 Python 3.8。
 """
@@ -12,9 +14,11 @@ import os
 
 try:
     from . import template_registry
+    from . import topology
     from .study import add_artifact, link
 except ImportError:
     import template_registry
+    import topology
     from study import add_artifact, link
 
 
@@ -23,9 +27,11 @@ class StudyRunError(Exception):
 
 
 def run_study(study_id, parameter_set, template_id, catia, conn,
-              params_dir=None, templates_dir=None):
+              params_dir=None, templates_dir=None, topo_dir=None,
+              holes=None, stringer_runout=None, partial_ribs=None,
+              with_topology=True):
     """
-    执行一次 Study（M1 片段）。返回 dict 汇总。
+    执行一次 Study。返回 dict 汇总。
 
     参数:
         study_id      : 已存在的 Study id
@@ -33,6 +39,9 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         template_id   : 模板 id（见 data/templates）
         catia         : CatiaDriver 实例（真机 RealCatiaDriver / 测试 FakeCatiaDriver）
         conn          : 打开的数据库连接
+        topo_dir      : 拓扑 JSON 落盘目录（None 则用内联标识）
+        holes / stringer_runout / partial_ribs : 拓扑缺陷输入（见 topology 模块）
+        with_topology : 是否生成结构拓扑与自然格（票 03）
     """
     tpl = template_registry.load(template_id, templates_dir)
 
@@ -64,7 +73,7 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
                           conn=conn)
     link(ps_id, cat_id, conn=conn)
 
-    return {
+    result = {
         "study_id": study_id,
         "template": tpl.id,
         "parameters": params,
@@ -72,3 +81,36 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         "catpart_path": catpart.path,
         "catpart_checksum": catpart.checksum,
     }
+
+    # 4) 结构拓扑模型 -> 自然格 + 不连续格（票 03）
+    if with_topology:
+        model = topology.build_topology(
+            tpl.id, params, holes=holes,
+            stringer_runout=stringer_runout, partial_ribs=partial_ribs)
+
+        if topo_dir:
+            os.makedirs(topo_dir, exist_ok=True)
+            topo_uri = os.path.join(topo_dir, "topology.json")
+            with open(topo_uri, "w", encoding="utf-8") as fh:
+                fh.write(model.to_json())
+        else:
+            topo_uri = "topology:%s" % study_id
+
+        topo_id = add_artifact(
+            study_id, "topology", content_uri=topo_uri,
+            params={"n_bays_total": len(model.bays),
+                    "n_bays_valid": len(model.valid_bays),
+                    "n_bays_invalid": len(model.invalid_bays)},
+            conn=conn)
+        link(cat_id, topo_id, conn=conn)
+
+        result["artifacts"]["topology"] = topo_id
+        result["topology"] = {
+            "n_total": len(model.bays),
+            "n_valid": len(model.valid_bays),
+            "n_invalid": len(model.invalid_bays),
+            "invalid_ids": [b.id for b in model.invalid_bays],
+        }
+        result["topology_model"] = model
+
+    return result
