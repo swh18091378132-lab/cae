@@ -27,6 +27,9 @@ class Mesh(object):
         self.nodes = []
         self.elems = []
         self._node_index = {}   # (rounded_y, rounded_xi) -> node_id
+        # 票15：每自然格实际使用的细分数 {bay_id: (n_y, n_xi)}；
+        # 质量门加密后靠它反推"当前口径"，不必从单元数猜。
+        self.subdiv = {}
 
     # -- 节点去重：相邻自然格共边时必须复用同一批节点 --
     def node(self, y, xi):
@@ -81,30 +84,42 @@ class Mesh(object):
             "elems": [{"id": e["id"], "nodes": list(e["nodes"]),
                        "bay_id": e["bay_id"], "bay_valid": e["bay_valid"]}
                       for e in self.elems],
+            "subdiv": dict((k, list(v)) for k, v in self.subdiv.items()),
         }
 
 
 def build_mesh(model, subdiv_per_bay=4, subdiv_by_bay=None):
     """
-    由 TopologyModel 生成网格：每个自然格独立划 subdiv × subdiv，
+    由 TopologyModel 生成网格：每个自然格独立划 n_y × n_xi，
     相邻格共边复用节点，因此**不存在跨自然格边界的单元**。
 
     model          : topology.TopologyModel
     subdiv_per_bay : 全局默认每格每方向细分数（P1 口径）
     subdiv_by_bay  : 可选 {bay_id: n} 逐格覆盖（票15 自动加密用）；
-                     未列出的格沿用 subdiv_per_bay
+                     未列出的格沿用 subdiv_per_bay。
+                     值也可以是 (n_y, n_xi) 二元组做**各向异性**加密
+                     （长宽比超标时长边方向加倍才有用，见 mesh_quality）。
 
-    返回 Mesh
+    **签名保持不变**（票15 只在值上扩展允许类型），故既有调用零回归。
+    返回 Mesh；每格实际细分数记在 `mesh.subdiv`。
     """
     mesh = Mesh()
     per_bay = subdiv_by_bay or {}
     order = sorted(model.bays, key=lambda b: (b.rib_j, b.str_i))
     for bay in order:
-        n = int(per_bay.get(bay.id, subdiv_per_bay))
-        if n < 1:
-            n = 1
+        spec = per_bay.get(bay.id, subdiv_per_bay)
+        if isinstance(spec, (tuple, list)):
+            if len(spec) < 2:
+                raise ValueError("subdiv_by_bay[%r] 若为序列需 (n_y, n_xi)，实际 %r"
+                                 % (bay.id, spec))
+            n_y, n_xi = int(spec[0]), int(spec[1])
+        else:
+            n_y = n_xi = int(spec)
+        n_y = max(n_y, 1)
+        n_xi = max(n_xi, 1)
         mesh.add_quad(bay.y0, bay.y1, bay.xi0, bay.xi1,
-                      bay.id, bay.valid, n, n)
+                      bay.id, bay.valid, n_y, n_xi)
+        mesh.subdiv[bay.id] = (n_y, n_xi)
     return mesh
 
 

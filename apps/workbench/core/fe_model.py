@@ -74,8 +74,15 @@ def build_fe_model(topology_model, out_dir, subdiv_per_bay=4,
             from . import mesh_quality as mq_mod
         except ImportError:
             import mesh_quality as mq_mod
-        quality = mq_mod.apply_gate(topology_model, mesh, mesh_quality)
-        mesh = quality["mesh"]
+        gate = mq_mod.apply_gate(topology_model, mesh, mesh_quality)
+        mesh = gate["mesh"]
+        # policy["enabled"]=False 表示整道门关闭（网格原样交付）：此时不留质量报告，
+        # 免得 run_study 的产物把它记成"已启用质量门"。
+        # 报告里去掉 "mesh"（就是本 FeModel.mesh，重复持有易误序列化）。
+        quality = None
+        if gate.get("enabled"):
+            quality = dict(gate)
+            quality.pop("mesh", None)
 
     ok, problems = meshgen.verify_no_straddle(topology_model, mesh)
     if not ok:
