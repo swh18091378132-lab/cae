@@ -538,6 +538,57 @@ def layout_from_params(params, holes=None, stringer_runout=None,
               partial_ribs=partial_ribs)
 
 
+def cutouts_from_rule(rule, params):
+    """
+    把模板声明的部件族固有开口（`topology.cutouts`）解析成 holes 列表（票 12）。
+
+    尾翼盒段的**操纵面切口**不是用户逐次输入的临时开口，而是部件族的结构特征
+    （升降舵/方向舵的位置），因此随模板声明、随参数一起变化。声明形式::
+
+        "topology": {
+          "cutouts": [
+            {"name": "elevator_cutout",
+             "cy":  "cutout_span_frac",     // 沿 y 的分数（0=起点，1=终点）
+             "cxi": "cutout_chord_frac"}    // 沿 xi 的分数（xi 子区间内）
+          ]
+        }
+
+    cy / cxi 的取值口径与 `layout_from_params(holes=...)` 完全一致：数字、
+    参数名字符串、或 {"param": ...} / {"value": ...}。
+    机翼盒段模板未声明 cutouts -> 返回 []（P1 零回归）。
+
+    返回 [{'cy': float, 'cxi': float, 'name': str}]
+    """
+    rule = rule or {}
+    decl = rule.get("cutouts")
+    if not decl:
+        return []
+    if not isinstance(decl, list):
+        raise TopologyError("模板 topology.cutouts 应为数组，实际 %r" % (decl,))
+
+    out = []
+    for idx, item in enumerate(decl):
+        name = "cutout-%d" % (idx + 1)
+        if isinstance(item, dict):
+            if item.get("name"):
+                name = str(item["name"])
+            cy = _resolve_bound(item.get("cy"), params, 0.5)
+            cxi = _resolve_bound(item.get("cxi"), params, 0.5)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            cy = _resolve_bound(item[0], params, 0.5)
+            cxi = _resolve_bound(item[1], params, 0.5)
+        else:
+            raise TopologyError(
+                "无法解析 topology.cutouts[%d]: %r（应为对象或 [cy, cxi]）"
+                % (idx, item))
+        if not (0.0 < cy < 1.0) or not (0.0 < cxi < 1.0):
+            raise TopologyError(
+                "开口 %s 的位置应在 (0,1) 开区间内（沿 y / 沿 xi 的分数），"
+                "实际 cy=%r, cxi=%r" % (name, cy, cxi))
+        out.append({"cy": cy, "cxi": cxi, "name": name})
+    return out
+
+
 def physical_from_rule(rule, params, mode=None):
     """
     从模板声明推导参数空间的**物理尺度**。
@@ -581,7 +632,12 @@ def build_topology(template_id, params, holes=None, stringer_runout=None,
     template : 可选，已加载的 Template 实例（避免服务层重复读盘）
     rule     : 可选，直接给拓扑声明 dict（纯算法单测用，绕开模板文件）
                e.g. {"mode": "cylinder_section"}
+               e.g. {"mode": "wing_surface",
+                     "cutouts": [{"cy": 0.6, "cxi": 0.4}]}
     模板未声明 topology 时回退翼面类（= P1 机翼盒段规则，故零回归）。
+
+    holes 与模板声明的 cutouts **合并**：模板声明的是部件族固有开口
+    （例：尾翼的操纵面切口），holes 是本次运行额外叠加的开口。
     """
     if rule is None:
         try:
@@ -590,6 +646,12 @@ def build_topology(template_id, params, holes=None, stringer_runout=None,
         except (IOError, OSError):
             # 纯算法单测常直接给 template_id 而不落模板文件；按翼面类默认处理
             rule = {"mode": DEFAULT_MODE}
+    # 部件族固有开口 + 调用方叠加开口（票12）
+    declared = cutouts_from_rule(rule, params)
+    if holes:
+        holes = declared + list(holes)
+    elif declared:
+        holes = declared
     stringers, ribs, holes_abs = layout_from_params(
         params, holes=holes, stringer_runout=stringer_runout,
         partial_ribs=partial_ribs, rule=rule)
