@@ -86,9 +86,10 @@ def cmd_lineage(sid):
     print_lineage(sid)
 
 
-def cmd_run(template_id, mode="fake"):
-    """一条命令跑完整个 P1 链（票 08）。"""
+def cmd_run(template_id, mode="fake", analysis=None, mesh_quality=None):
+    """一条命令跑完整个 P1 链（票 08）；P2 起可追加分析类型与网格策略（票10/14/15）。"""
     from workbench_service import WorkbenchService
+    from run_study import RunOptions
 
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(os.path.dirname(here))
@@ -100,7 +101,15 @@ def cmd_run(template_id, mode="fake"):
         sid = svc.start_study("CLI 分析 %s" % template_id)
         print("Study: %s   模板: %s   模式: %s" % (sid, template_id, mode))
         print("参数: %s" % json.dumps(params, ensure_ascii=False, sort_keys=True))
-        res = svc.run_chain(sid, params, template_id)
+
+        # 选项对象：新增能力只加字段，run_study 签名不变（票10 的核心诉求）
+        opts = RunOptions()
+        if analysis:
+            opts.analysis = analysis
+        if mesh_quality:
+            opts.mesh_quality = mesh_quality
+
+        res = svc.run_chain(sid, params, template_id, options=opts)
         print()
         print(svc.format_lineage_text(sid))
         chk = res.get("check") or {}
@@ -132,9 +141,15 @@ if __name__ == "__main__":
     elif args[0] == "lineage" and len(args) >= 2:
         cmd_lineage(args[1])
     elif args[0] == "run":
-        tpl = args[1] if len(args) >= 2 else "wingbox_v1"
+        tpl = args[1] if len(args) >= 2 and not args[1].startswith("-") else "wingbox_v1"
         mode = "real" if "--real" in args else "fake"
-        sys.exit(cmd_run(tpl, mode))
+        # --analysis <类型>：static/frequency/buckle/contact/nonlinear/explicit
+        analysis = None
+        if "--analysis" in args:
+            i = args.index("--analysis")
+            if len(args) > i + 1:
+                analysis = args[i + 1]
+        sys.exit(cmd_run(tpl, mode, analysis=analysis))
     elif args[0] == "ui":
         mode = "real" if "--real" in args else "fake"
         sys.exit(cmd_ui(mode))

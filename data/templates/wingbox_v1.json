@@ -17,5 +17,10 @@
       "span / max(n_ribs-1,1) >= 0.3"
     ]
   },
+  "topology": {
+    "mode": "wing_surface",
+    "note": "翼面类布置：肋(等 y 线) × 长桁(等 xi 线)。P2 起拓扑生成按此声明分派（票11）。",
+    "params": {"axial": "span", "n_frames": "n_ribs", "n_stringers": "n_stringers"}
+  },
   "template_file": "data/templates/wingbox_v1.CATPart"
 }

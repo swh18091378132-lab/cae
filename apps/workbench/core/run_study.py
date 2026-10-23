@@ -39,6 +39,159 @@ class StudyRunError(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# 运行选项（票10）：把 P1 时代膨胀到 31 个的位置参数收进一个带默认值的对象
+# ---------------------------------------------------------------------------
+#
+# 设计约束（票10 验收）：
+#   * run_study 的**签名不再随能力增长**——新增能力 = 往 RunOptions 加字段；
+#   * 不传 options 即可跑通 P1 全链（每个字段都有合理默认值）；
+#   * 旧的**关键字**调用形式仍然可用（向后兼容，P1 的 m0~m8 不改断言）。
+#
+# 字段分三组：必备流程（study/参数/模板/适配器/连接 仍是 run_study 的位置参数）、
+# 落盘目录、各阶段开关与参数。
+
+class RunOptions(object):
+    """
+    一次 Study 运行的可选参数集合。所有字段都有默认值。
+
+    用法::
+
+        run_study(sid, params, "wingbox_v1", catia, conn)               # 默认
+        run_study(sid, params, "wingbox_v1", catia, conn, RunOptions(with_solve=True, abaqus=fake))
+        run_study(sid, params, "wingbox_v1", catia, conn, with_solve=True, abaqus=fake)  # 兼容旧写法
+
+    扩展方式（后续票）：直接 `opts.analysis = AnalysisSpec(...)`，或
+    `RunOptions(analysis=...)`；run_study 的签名不变。未知字段也不会丢，
+    存在 `opts.extra` 里，用 `opts.get("名字")` 读。
+    """
+
+    DEFAULTS = {
+        # --- 目录 ---
+        "params_dir": None,
+        "templates_dir": None,
+        "topo_dir": None,
+        # --- 拓扑（票03）---
+        "holes": None,
+        "stringer_runout": None,
+        "partial_ribs": None,
+        "with_topology": True,
+        # --- FE 模型（票04）---
+        "with_fe_model": False,
+        "fe_dir": None,
+        "subdiv_per_bay": 4,
+        "plies": None,
+        "material": None,
+        "step": None,
+        "load": None,
+        # --- 求解与抽取（票05）---
+        "abaqus": None,
+        "with_solve": False,
+        "job_name": "job1",
+        "solve_dir": None,
+        # P2（票14）：分析类型与其参数；None = 沿用 P1 的静力默认
+        "analysis": None,
+        # --- 强度校核（票06）---
+        "with_check": False,
+        "rules": None,
+        "rules_path": None,
+        "check_dir": None,
+        # --- 报告（票07）---
+        "with_report": False,
+        "report_dir": None,
+        "report_template_path": None,
+        "report_out": None,
+        "report_options": None,
+        # --- P2 扩展位（先占位，由后续票填充语义）---
+        "mesh_quality": None,      # 票15：网格质量门策略
+        "model_config_id": None,   # 票16：型号配置引用
+    }
+
+    def __init__(self, **kwargs):
+        self._explicit = set(kwargs.keys())
+        for name, default in self.DEFAULTS.items():
+            setattr(self, name, kwargs.pop(name, default))
+        # 未知字段照存不丢（字典/列表等可变默认值无需深拷贝：调用方各自传入）
+        self.extra = kwargs
+
+    # -- 读写 --------------------------------------------------------------
+
+    def get(self, name, default=None):
+        """读一个字段；未声明字段回退到 extra。"""
+        if name in self.DEFAULTS:
+            return getattr(self, name, default)
+        return self.extra.get(name, default)
+
+    def set(self, name, value):
+        """写一个字段；未声明字段进 extra（不需要改 run_study 签名）。"""
+        self._explicit.add(name)
+        if name in self.DEFAULTS:
+            setattr(self, name, value)
+        else:
+            self.extra[name] = value
+        return self
+
+    def replace(self, **kwargs):
+        """基于当前值派生一份新选项（服务层组合各阶段开关时用）。"""
+        merged = dict((k, getattr(self, k)) for k in self.DEFAULTS)
+        merged.update(self.extra)
+        out = RunOptions(**merged)
+        out._explicit = set(self._explicit)
+        for k, v in kwargs.items():
+            out.set(k, v)
+        return out
+
+    def overlay(self, other):
+        """
+        把另一个选项里**显式设置过**的字段盖到自己上面，返回新对象。
+
+        与 replace(**other.to_dict()) 的区别：未显式设置（仍是默认值）的字段不会
+        把当前的定制值冲掉——服务层先铺好目录/开关，再让调用方按需覆盖时正是要这个。
+        """
+        if other is None:
+            return self.replace()
+        if isinstance(other, dict):
+            other = RunOptions(**other)
+        if not isinstance(other, RunOptions):
+            raise StudyRunError("overlay 需要 RunOptions 或 dict，实际 %r"
+                                % type(other).__name__)
+        out = self.replace()
+        for name in other._explicit:
+            out.set(name, other.get(name))
+        return out
+
+    def to_dict(self):
+        d = dict((k, getattr(self, k)) for k in self.DEFAULTS)
+        d.update(self.extra)
+        return d
+
+    def __repr__(self):
+        on = [k for k in ("with_topology", "with_fe_model", "with_solve",
+                          "with_check", "with_report") if getattr(self, k)]
+        return "RunOptions(%s)" % ", ".join(on)
+
+    # -- 归一化 ------------------------------------------------------------
+
+    @classmethod
+    def coerce(cls, options=None, legacy=None):
+        """
+        把 (options, legacy_kwargs) 归一成一个 RunOptions。
+
+        options 可为 None / dict / RunOptions；legacy_kwargs 是老的**关键字**写法，
+        显式传入的 legacy 值覆盖 options 里的同名字段。
+        """
+        if options is None:
+            base = cls()
+        elif isinstance(options, cls):
+            base = options
+        elif isinstance(options, dict):
+            base = cls(**options)
+        else:
+            raise StudyRunError("options 必须是 RunOptions 或 dict，实际 %r"
+                                % type(options).__name__)
+        return base.replace(**(legacy or {}))
+
+
 def _study_name(study_id, conn):
     """取 Study 名称；查不到则退回 id（报告标题栏用）。"""
     try:
@@ -50,28 +203,53 @@ def _study_name(study_id, conn):
 
 
 def run_study(study_id, parameter_set, template_id, catia, conn,
-              params_dir=None, templates_dir=None, topo_dir=None,
-              holes=None, stringer_runout=None, partial_ribs=None,
-              with_topology=True, with_fe_model=False, fe_dir=None,
-              subdiv_per_bay=4, plies=None, material=None,
-              step=None, load=None,
-              abaqus=None, with_solve=False, job_name="job1", solve_dir=None,
-              with_check=False, rules=None, rules_path=None, check_dir=None,
-              with_report=False, report_dir=None, report_template_path=None,
-              report_out=None):
+              options=None, **legacy):
     """
     执行一次 Study。返回 dict 汇总。
 
-    参数:
+    **必需参数（就这 5 个）**:
         study_id      : 已存在的 Study id
         parameter_set : 用户输入参数 dict
         template_id   : 模板 id（见 data/templates）
         catia         : CatiaDriver 实例（真机 RealCatiaDriver / 测试 FakeCatiaDriver）
         conn          : 打开的数据库连接
-        topo_dir      : 拓扑 JSON 落盘目录（None 则用内联标识）
-        holes / stringer_runout / partial_ribs : 拓扑缺陷输入（见 topology 模块）
-        with_topology : 是否生成结构拓扑与自然格（票 03）
+
+    **选项参数**:
+        options       : RunOptions 实例或 dict；也可用旧的**关键字**形式直接传
+                        （params_dir=... / with_solve=True / ...），二者可混用，
+                        关键字优先。见 RunOptions 的字段表。
+
+    新增能力时往 RunOptions 加字段即可，本签名保持不变。
     """
+    opts = RunOptions.coerce(options, legacy)
+
+    params_dir = opts.params_dir
+    templates_dir = opts.templates_dir
+    topo_dir = opts.topo_dir
+    holes = opts.holes
+    stringer_runout = opts.stringer_runout
+    partial_ribs = opts.partial_ribs
+    with_topology = opts.with_topology
+    with_fe_model = opts.with_fe_model
+    fe_dir = opts.fe_dir
+    subdiv_per_bay = opts.subdiv_per_bay
+    plies = opts.plies
+    material = opts.material
+    step = opts.step
+    load = opts.load
+    abaqus = opts.abaqus
+    with_solve = opts.with_solve
+    job_name = opts.job_name
+    solve_dir = opts.solve_dir
+    with_check = opts.with_check
+    rules = opts.rules
+    rules_path = opts.rules_path
+    check_dir = opts.check_dir
+    with_report = opts.with_report
+    report_dir = opts.report_dir
+    report_template_path = opts.report_template_path
+    report_out = opts.report_out
+
     tpl = template_registry.load(template_id, templates_dir)
 
     # 1) 参数契约 + 参数化包络校验（不通过直接抛，不产生任何产物）
@@ -112,11 +290,12 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         "catpart_checksum": catpart.checksum,
     }
 
-    # 4) 结构拓扑模型 -> 自然格 + 不连续格（票 03）
+    # 4) 结构拓扑模型 -> 自然格 + 不连续格（票 03；票 11 起按模板声明分派布置规则）
     if with_topology:
         model = topology.build_topology(
             tpl.id, params, holes=holes,
-            stringer_runout=stringer_runout, partial_ribs=partial_ribs)
+            stringer_runout=stringer_runout, partial_ribs=partial_ribs,
+            template=tpl)
 
         if topo_dir:
             os.makedirs(topo_dir, exist_ok=True)
@@ -345,7 +524,8 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         ctx = report_mod.build_report_context(result)
         out_path = report_out or os.path.join(rdir, "strength_report.docx")
         try:
-            rr = report_mod.render_report(study_id, ctx, tpl_path, out_path)
+            rr = report_mod.render_report(study_id, ctx, tpl_path, out_path,
+                                          report_options=opts.report_options)
         except Exception as exc:
             raise StudyRunError("报告渲染失败: %s" % exc)
 

@@ -118,33 +118,42 @@ class WorkbenchService(object):
 
     def run_chain(self, study_id, parameter_set, template_id,
                   plies=None, rules=None, load=None,
-                  subdiv_per_bay=1, with_report=True):
+                  subdiv_per_bay=1, with_report=True, options=None):
         """
         跑完整 P1 链：参数 -> 数模 -> 拓扑 -> FE -> 求解 -> 抽取 -> 校核 -> 报告。
         返回 run_study 的结果 dict（含 artifacts / check / report）。
+
+        options: RunOptions（票10）。服务层先按工作台目录约定填好各阶段目录与开关，
+                 再用调用方传入的 options 覆盖——于是新增能力（分析类型、网格策略、
+                 型号配置等）只需传 options，不必改本方法签名。
         """
         plies = plies or [{"angle": 0.0, "thickness": 0.1},
                           {"angle": 90.0, "thickness": 0.1}]
         rules = rules or {"criteria": ["tsai_wu", "hashin"]}
 
+        base = rs_mod.RunOptions(
+            params_dir=self._dir(study_id, "params"),
+            topo_dir=self._dir(study_id, "topo"),
+            with_topology=True,
+            with_fe_model=True,
+            fe_dir=self._dir(study_id, "fe"),
+            subdiv_per_bay=subdiv_per_bay,
+            plies=plies,
+            load=load,
+            abaqus=self._abaqus(),
+            with_solve=True,
+            job_name="job1",
+            solve_dir=self._dir(study_id, "solve"),
+            with_check=True,
+            check_dir=self._dir(study_id, "check"),
+            rules=rules,
+            with_report=with_report,
+            report_dir=self._dir(study_id, "report"))
+
         try:
             result = rs_mod.run_study(
                 study_id, parameter_set, template_id,
-                self._catia(study_id), self.conn,
-                params_dir=self._dir(study_id, "params"),
-                topo_dir=self._dir(study_id, "topo"),
-                with_fe_model=True,
-                fe_dir=self._dir(study_id, "fe"),
-                subdiv_per_bay=subdiv_per_bay,
-                plies=plies, load=load,
-                abaqus=self._abaqus(),
-                with_solve=True, job_name="job1",
-                solve_dir=self._dir(study_id, "solve"),
-                with_check=True,
-                check_dir=self._dir(study_id, "check"),
-                rules=rules,
-                with_report=with_report,
-                report_dir=self._dir(study_id, "report"))
+                self._catia(study_id), self.conn, base.overlay(options))
         except Exception as exc:
             raise ServiceError(str(exc))
         return result
