@@ -111,6 +111,57 @@ CREATE INDEX IF NOT EXISTS idx_decisions_study ON decisions(study_id);
 CREATE INDEX IF NOT EXISTS idx_mc_parts_model ON model_config_parts(model_id);
 CREATE INDEX IF NOT EXISTS idx_approval_study ON report_approvals(study_id, version);
 CREATE INDEX IF NOT EXISTS idx_approval_status ON report_approvals(status);
+
+-- ===========================================================================
+-- P3 新增（票25 优化会话与设计点）
+--
+-- 迁移策略与 P2 一致：**只新增表，不改既有表结构**。两张表都用
+-- CREATE TABLE IF NOT EXISTS，旧库打开时幂等建出，P1/P2 历史数据不受影响。
+-- ===========================================================================
+
+-- 优化会话（票25）：意图 / 预算 / 设计向量声明快照 —— "当初想优化什么"落库
+CREATE TABLE IF NOT EXISTS optimization_sessions (
+    id                 TEXT PRIMARY KEY,      -- 例：OPT-20261023-120000-a1b2
+    name               TEXT NOT NULL,
+    template_id        TEXT NOT NULL,         -- 部件族（决定用哪套参数契约）
+    intent_json        TEXT NOT NULL,         -- 优化意图：目标 + 约束声明（JSON）
+    budget_json        TEXT NOT NULL,         -- 收敛配置：预算三元组（JSON）
+    design_vector_json TEXT NOT NULL,         -- 设计向量声明**快照**（JSON）
+    status             TEXT NOT NULL,         -- created/running/finished/failed
+    result_json        TEXT,                  -- 结算快照（停止原因/评估次数）
+    adoption_json      TEXT,                  -- L2 采用决策快照（NULL = 未批准）
+    note               TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+-- 设计点（票25）：一个优化会话内的某个设计向量 + 它那一次独立 Study 的结论
+--   一个点 = 一个独立 Study（ADR-0009：每轮产生新 Study，绝不覆盖）
+CREATE TABLE IF NOT EXISTS optimization_points (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL REFERENCES optimization_sessions(id),
+    seq              INTEGER NOT NULL,        -- 会话内评估顺序（从 1 起）
+    vector_json      TEXT NOT NULL,           -- 设计向量（JSON）
+    vector_key       TEXT NOT NULL,           -- 去重键（与 optimizer.vector_key 同口径）
+    study_id         TEXT REFERENCES studies(id),  -- 该点对应的独立 Study
+    group_name       TEXT NOT NULL,           -- feasible/infeasible/failed（三分组）
+    ok               INTEGER NOT NULL,        -- 技术层面是否跑通
+    feasible         INTEGER,                 -- 是否满足约束（NULL = 技术故障）
+    objective_value  REAL,                    -- 目标值（技术故障时为 NULL）
+    evaluation_json  TEXT NOT NULL,           -- objectives.evaluate 的完整结果（权威）
+    error_json       TEXT,                    -- 技术故障原因（kind + message）
+    source           TEXT,                    -- baseline/doe/local/manual
+    reused_from      TEXT,                    -- 复用了哪个 Study 的数模（ADR-0005）
+    created_at       TEXT NOT NULL,
+    UNIQUE(session_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_opt_points_session
+    ON optimization_points(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_opt_points_group
+    ON optimization_points(session_id, group_name);
+CREATE INDEX IF NOT EXISTS idx_opt_points_study
+    ON optimization_points(study_id);
 """
 
 # P1 库升级补丁（票16「P1 既有数据可平滑升级」）：
