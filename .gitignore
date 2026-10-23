@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试/临时
+.tmp_test/
+.pytest_cache/
+
+# 运行时数据（保留 data/templates 模板）
+data/studies/
+data/*.db
+data/*.sqlite
+apps/workbench/data/
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.tmp

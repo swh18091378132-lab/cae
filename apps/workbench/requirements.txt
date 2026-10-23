@@ -1,0 +1,9 @@
+# P1 本地工作台依赖 —— 按 Windows 7 SP1 x64 + CPython 3.8.10 钉死
+# 依据: research_win7_toolchain.md（均有 cp38 win_amd64 轮子）
+# 环境前置: Win7 SP1 x64 + KB2533623 + VC++2015-2019 运行库(UCRT)
+# 注意: 避开 pyarrow/parquet（Win7 + py3.8 上不可靠）；结果交互用 CSV/JSON + SQLite
+numpy==1.24.4
+openpyxl==3.1.5
+python-docx==1.1.2
+lxml==4.9.4
+pywin32==306

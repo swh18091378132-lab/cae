@@ -1,0 +1,21 @@
+{
+  "id": "wingbox_v1",
+  "name": "机翼盒段 v1（后掠锥度，参数化外形）",
+  "description": "P1 首个结构族模板。参数驱动外形壳面，铺层不在此定义（铺层作 CAE 属性，ADR-0005）。",
+  "parameters": [
+    {"name": "span",        "type": "float", "min": 5.0,  "max": 40.0, "default": 12.0, "unit": "m",  "map": "展长"},
+    {"name": "sweep_deg",   "type": "float", "min": 0.0,  "max": 60.0, "default": 25.0, "unit": "deg","map": "后掠角"},
+    {"name": "c_root",      "type": "float", "min": 0.5,  "max": 8.0,  "default": 3.0,  "unit": "m",  "map": "根弦长"},
+    {"name": "c_tip",       "type": "float", "min": 0.2,  "max": 5.0,  "default": 1.2,  "unit": "m",  "map": "尖弦长"},
+    {"name": "n_ribs",      "type": "int",   "min": 2,    "max": 40,   "default": 6,    "unit": "",   "map": "肋数(含两端的肋)"},
+    {"name": "n_stringers", "type": "int",   "min": 2,    "max": 60,   "default": 7,    "unit": "",   "map": "长桁数(含前后梁)"}
+  ],
+  "envelope": {
+    "note": "参数化包络：在以下约束内改参免重建模板；超出则触发换模板。",
+    "constraints": [
+      "c_tip < c_root",
+      "span / max(n_ribs-1,1) >= 0.3"
+    ]
+  },
+  "template_file": "data/templates/wingbox_v1.CATPart"
+}
