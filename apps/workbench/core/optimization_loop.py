@@ -62,6 +62,7 @@ optimizer/approval）。**不 import numpy**（目标机 Win7 + py3.8）。
 
 import datetime
 import json
+import math
 import os
 import uuid
 
@@ -71,6 +72,7 @@ try:
     from . import objectives
     from . import optimizer
     from . import study as study_mod
+    from . import surrogate as surrogate_mod
     from . import template_registry
     from . import textfmt
 except ImportError:  # 允许在 core 目录内直接运行
@@ -79,6 +81,7 @@ except ImportError:  # 允许在 core 目录内直接运行
     import objectives
     import optimizer
     import study as study_mod
+    import surrogate as surrogate_mod
     import template_registry
     import textfmt
 
@@ -125,11 +128,85 @@ SOURCE_BASELINE = "baseline"   # 会话起点：设计向量声明里的默认�
 SOURCE_DOE = "doe"             # 优化器的 DOE 采样
 SOURCE_LOCAL = "local"         # 优化器的邻域搜索
 SOURCE_MANUAL = "manual"       # 调用方单独评估一个点
+#: 票27：该点是**代理模型建议优先评估**的（只影响"先算哪个"，不影响合格判定）
+SOURCE_SURROGATE = "surrogate"
 
 #: 三分组名（与 optimizer.GROUP_NAMES 同一口径，不另造命名）
 GROUP_FEASIBLE = "feasible"
 GROUP_INFEASIBLE = "infeasible"
 GROUP_FAILED = "failed"
+
+# ---------------------------------------------------------------------------
+# 票27：代理模型快筛（可选，默认关闭）
+# ---------------------------------------------------------------------------
+
+#: 快筛状态 —— 汇总里据此区分"代理在起作用"与"确定性路径"
+SURROGATE_OFF = "off"            # 未启用（默认）
+SURROGATE_WAITING = "waiting"    # 已启用，但样本还不够，尚未拟合
+SURROGATE_ACTIVE = "active"      # 拟合成功且误差达标 -> 参与排序
+SURROGATE_DEGRADED = "degraded"  # 拟合过但不可用（样本不足/误差超标/矩阵奇异）-> 不排序
+
+#: 默认快筛策略。**默认关闭**：数据不够或算力不足时闭环退化为纯确定性路径。
+DEFAULT_SURROGATE_POLICY = {
+    "enabled": False,      # 总开关（票27 验收项：默认关闭时与 #25 一致）
+    "prefetch": 2,         # 每轮用代理挑几个点先算（只影响"先算哪个"）
+    "max_mae_ratio": surrogate_mod.DEFAULT_MAX_MAE_RATIO,
+    "max_rmse_ratio": surrogate_mod.DEFAULT_MAX_RMSE_RATIO,
+}
+
+
+def normalize_surrogate_policy(policy=None):
+    """
+    归一化快筛策略；None / 空 dict 得到**默认关闭**的策略。
+
+    非法值早报（而不是跑到一半才发现 prefetch 是字符串）。
+    """
+    out = dict(DEFAULT_SURROGATE_POLICY)
+    if policy:
+        if not isinstance(policy, dict):
+            raise OptimizationLoopError(
+                "快筛策略 surrogate 应为 dict，实际 %r"
+                % type(policy).__name__, code="invalid-intent")
+        out.update(policy)
+
+    out["enabled"] = bool(out.get("enabled", False))
+    try:
+        prefetch = int(out.get("prefetch", 2))
+    except (TypeError, ValueError):
+        raise OptimizationLoopError("surrogate.prefetch 必须是整数，实际 %r"
+                                    % (out.get("prefetch"),),
+                                    code="invalid-intent")
+    out["prefetch"] = max(0, prefetch)
+    for key in ("max_mae_ratio", "max_rmse_ratio"):
+        try:
+            value = float(out[key])
+        except (TypeError, ValueError):
+            raise OptimizationLoopError("surrogate.%s 必须是数值，实际 %r"
+                                        % (key, out.get(key)),
+                                        code="invalid-intent")
+        if value <= 0.0:
+            raise OptimizationLoopError("surrogate.%s 必须为正数，实际 %r"
+                                        % (key, value), code="invalid-intent")
+        out[key] = value
+    return out
+
+
+def public_surrogate_policy(policy):
+    """
+    只保留可 JSON 序列化的策略键（用于落库快照）。
+
+    策略里允许注入 `fit`（测试用替身/上层自定义拟合器）——那是运行期对象，
+    不能进数据库。快照里去掉它，保证"当初的策略"是可读、可复算的数据。
+    """
+    out = {}
+    for key, value in (policy or {}).items():
+        if callable(value):
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[key] = value
+    return out
+
+
 
 
 class OptimizationLoopError(ValueError):
@@ -282,7 +359,8 @@ def _session_from_row(row):
 
 
 def create_session(conn, design_vector_spec, template_id=None, intent=None,
-                   budget=None, name=None, note=None, session_id=None):
+                   budget=None, name=None, note=None, session_id=None,
+                   surrogate=None):
     """
     创建优化会话：意图 + 收敛配置（预算三元组）+ 设计向量声明快照 **全部落库**。
 
@@ -296,6 +374,9 @@ def create_session(conn, design_vector_spec, template_id=None, intent=None,
     intent               : 优化意图（见 `normalize_intent`）；None = 默认减重意图
     budget               : 预算三元组 {max_evals, max_rounds, improvement_threshold}
     session_id           : 可选，显式指定（测试/复现用）；None 则自动生成
+    surrogate            : 可选，快筛策略（票27）；**None = 默认关闭**。
+                           建会话时把开关记进意图快照，于是"当初是否启用快筛"
+                           也是记录在案的事实。
 
     返回会话 dict（与 `get_session` 同形）。
     """
@@ -312,6 +393,9 @@ def create_session(conn, design_vector_spec, template_id=None, intent=None,
             code="invalid-spec")
 
     normalized_intent = normalize_intent(intent)
+    # 票27：快筛开关记进意图快照（可追溯"当初有没有启用代理快筛"）
+    normalized_intent["surrogate"] = public_surrogate_policy(
+        normalize_surrogate_policy(surrogate))
 
     try:
         bud = optimizer.normalize_budget(budget)
@@ -766,9 +850,10 @@ def _persist_point(conn, session_id, vector, evaluation, study_id, source,
 # ---------------------------------------------------------------------------
 
 def run_optimization(conn, session_id, catia, options=None, work_dir=None,
-                     abaqus=None, seed=0, budget=None, max_evals=None):
+                     abaqus=None, seed=0, budget=None, max_evals=None,
+                     surrogate=None):
     """
-    跑一次完整优化：基线点 -> DOE -> 邻域/步长收缩 -> 三分组汇总。
+    跑一次完整优化：基线点 -> (可选)代理快筛预取 -> DOE -> 邻域/步长收缩 -> 汇总。
 
     基线点先评估（设计向量声明里的默认值 = 当前设计）：它既是搜索起点，
     也是「维持原设计」这个决策的对照基准。之后交给 `optimizer.optimize`
@@ -786,6 +871,9 @@ def run_optimization(conn, session_id, catia, options=None, work_dir=None,
     seed              : 随机种子（同种子同结果）
     budget            : 覆盖会话里记录的预算（默认用会话记录的）
     max_evals         : 可选，覆盖 max_evals（快速冒烟用）
+    surrogate         : 可选，快筛策略（票27）。**默认 None = 关闭**，
+                        此时轨迹与纯确定性路径完全一致。
+                        形如 {"enabled": True, "prefetch": 2, ...}
 
     返回 dict（与 `summarize` 同形）：会话、停止原因、三分组、最优、建议采用点。
     """
@@ -803,34 +891,94 @@ def run_optimization(conn, session_id, catia, options=None, work_dir=None,
     if work_dir is None:
         work_dir = default_work_dir()
 
+    # 票27：快筛策略归一（默认关闭）。关闭时下面所有快筛分支都不执行。
+    surro_policy = normalize_surrogate_policy(surrogate)
+
     _set_session_status(conn, session_id, SESSION_RUNNING)
+
+    def evaluate_vector(vector, source):
+        """跑一个独立 Study 并落库（快筛预取与优化器回调共用这一个入口）。"""
+        return evaluate_point(conn, session_id, vector, catia, options=options,
+                              work_dir=work_dir, abaqus=abaqus, source=source)
 
     # ---- 1) 基线点：先评估"当前设计"，它是搜索起点与维持原设计的对照 ----
     baseline_vector = design_vector.default_vector(spec)
     if _find_point(conn, session_id, optimizer.vector_key(baseline_vector)) is None:
-        evaluate_point(conn, session_id, baseline_vector, catia,
-                       options=options, work_dir=work_dir, abaqus=abaqus,
-                       source=SOURCE_BASELINE)
+        evaluate_vector(baseline_vector, SOURCE_BASELINE)
 
-    # ---- 2) 交给优化器（它只认注入的 evaluate 回调） ----
+    # ---- 2) 票27：代理模型快筛（只影响"先算哪个"） ----
+    #
+    # 顺序说明：**先让确定性优化器跑一段攒样本，再拟合 -> 预取**。
+    # 为什么不是"一开始就拟合"：刚起步时只有基线点，任何代理都无从拟合；
+    # 而 #23 的优化器是"DOE 起步 + 邻域搜索"，它自己就会产出前几个样本。
+    # 于是这里把闭环切成两段：
+    #   (a) 先跑一小段确定性搜索，攒够 min_samples；
+    #   (b) 拟合成功且误差达标 -> 用代理挑接下来的 prefetch 个点先算；
+    #   (c) 再用这些点作为 history 续跑优化器（它不会重算已有的点）。
+    # 这样"累积 -> 拟合 -> 排序"三步都真实发生，#25 的确定性路径只是其一特例。
+    #
+    # **预算必须全局算**：`optimizer.optimize` 的 max_evals 是**每次调用**的上限，
+    # 而这里会调用它两次（攒样本 + 正式搜索）。若各自给满预算，总评估次数就会
+    # 翻倍、"同预算对照"也就失去意义。故每次都只给**剩余额度**。
+    surro_state = _surrogate_off_state()
+    n_prefetched = 0
+    opt_result = None
+    eval_budget = [int(bud["max_evals"])]        # 剩余可评估次数（可变）
+
+    def _spent():
+        return len(list_points(conn, session_id))
+
+    if surro_policy["enabled"]:
+        variables_min = surrogate_mod.min_samples_for(variables)
+        # (a) 攒样本：目标刚好够拟合（不多烧预算），再留出余量给正式搜索
+        usable_now = len(surrogate_mod.usable_points(
+            _history_records(conn, session_id))[0])
+        need = max(1, variables_min - usable_now)
+        spare = max(0, eval_budget[0] - _spent() - 1)
+        warm_evals = max(1, min(need, spare))
+        try:
+            optimizer.optimize(
+                variables,
+                lambda v: evaluate_vector(v, SOURCE_DOE)["evaluation"],
+                budget={"max_evals": warm_evals,
+                        "max_rounds": max(1, min(2, bud["max_rounds"])),
+                        "improvement_threshold": bud["improvement_threshold"]},
+                seed=seed, history=_history_records(conn, session_id))
+        except Exception:
+            pass            # 攒样本阶段失败不该拖垮整次优化（下面还会再跑）
+
+        # (b) 拟合 -> 误差达标才启用排序
+        surro_state, model = _fit_surrogate(conn, session_id, variables,
+                                            surro_policy)
+        if model is not None:
+            # (c) 用代理挑几个点先算（只影响顺序）
+            n_prefetched = _prefetch_by_surrogate(
+                conn, session_id, variables, model, surro_policy, bud,
+                evaluate_vector, seed=seed)
+            surro_state = _surrogate_state(
+                surro_policy, SURROGATE_ACTIVE, model=model,
+                n_prefetched=n_prefetched)
+
+    # ---- 3) 交给优化器（它只认注入的 evaluate 回调），只给剩余预算 ----
+    remaining = max(1, eval_budget[0] - _spent())
+    main_budget = dict(bud)
+    main_budget["max_evals"] = remaining
     history = _history_records(conn, session_id)
 
     def _callback(vector):
         """优化器每要一个点，就真的跑一个独立 Study，再把归一结果还给它。"""
-        rec = evaluate_point(conn, session_id, vector, catia, options=options,
-                             work_dir=work_dir, abaqus=abaqus,
-                             source=SOURCE_DOE)
-        return rec["evaluation"]
+        return evaluate_vector(vector, SOURCE_DOE)["evaluation"]
 
     try:
-        opt_result = optimizer.optimize(variables, _callback, budget=bud,
+        opt_result = optimizer.optimize(variables, _callback, budget=main_budget,
                                         seed=seed, history=history)
     except Exception as exc:
-        _set_session_status(conn, session_id, SESSION_FAILED,
-                            result={"error": str(exc)})
+        _set_session_status(
+            conn, session_id, SESSION_FAILED,
+            result={"error": str(exc), "surrogate": surro_state})
         raise OptimizationLoopError("优化编排失败: %s" % exc, code="run-failed")
 
-    # ---- 3) 结算：先把状态与结论快照落定，再返回汇总 ----
+    # ---- 4) 结算：先把状态与结论快照落定，再返回汇总 ----
     # 顺序要紧：`summarize` 从库里重算，若先汇总后落状态，返回的 status 会停在
     # "running"（测试据此判断会话是否正常收尾）。
     _set_session_status(conn, session_id, SESSION_FINISHED,
@@ -842,6 +990,9 @@ def run_optimization(conn, session_id, catia, options=None, work_dir=None,
                             "n_rounds": opt_result.get("n_rounds"),
                             "budget": opt_result.get("budget"),
                             "best_key": (opt_result.get("best") or {}).get("key"),
+                            # 票27：快筛状态随会话落库，汇总/重启后仍可查
+                            "surrogate": surro_state,
+                            "surrogate_n_prefetched": n_prefetched,
                             "finished_at": _now(),
                         })
     return summarize(conn, session_id, optimizer_result=opt_result)
@@ -866,8 +1017,240 @@ def _history_records(conn, session_id):
 
 
 # ---------------------------------------------------------------------------
-# 汇总查询
+# 票27：代理模型快筛（只影响"先算哪个"）
 # ---------------------------------------------------------------------------
+
+def _surrogate_off_state():
+    """未启用快筛时的状态（汇总里据此说明"走的是纯确定性路径"）。"""
+    return {
+        "enabled": False,
+        "status": SURROGATE_OFF,
+        "available": False,
+        "reason": "未启用代理模型快筛（默认关闭）：本轮为纯确定性 DOE + 邻域搜索",
+        "n_samples": 0,
+        "min_samples": 0,
+        "n_prefetched": 0,
+        "model_quality": None,
+        "thresholds": None,
+        "source": surrogate_mod.SOURCE_SURROGATE,
+    }
+
+
+def _surrogate_state(policy, status, model=None, reason=None, n_prefetched=0):
+    """构造一份快筛状态快照（写进会话结果、汇总里可见）。"""
+    model = model or {}
+    return {
+        "enabled": True,
+        "status": status,
+        "available": bool(model.get("available")),
+        "degraded": bool(model.get("degraded", status == SURROGATE_DEGRADED)),
+        "reason": reason or model.get("reason"),
+        "n_samples": model.get("n_samples", 0),
+        "min_samples": model.get("min_samples", 0),
+        "n_prefetched": int(n_prefetched),
+        "model_quality": model.get("quality"),
+        "thresholds": model.get("thresholds"),
+        # 只留可序列化的策略键（`fit` 是运行期对象，不进快照）
+        "policy": public_surrogate_policy(policy),
+        # 来源标记：所有代理相关结论都带它，汇总据此与实测区分
+        "source": surrogate_mod.SOURCE_SURROGATE,
+    }
+
+
+def _normalized_distance(a, b, variables):
+    """两个设计向量在**归一化设计空间**里的欧氏距离（各变量按范围缩放）。"""
+    total = 0.0
+    for spec in variables:
+        name = spec["name"]
+        if name not in a or name not in b:
+            continue
+        if spec.get("candidates"):
+            cands = [float(c) for c in spec["candidates"]]
+            span = max(cands) - min(cands)
+        else:
+            span = float(spec["max"]) - float(spec["min"])
+        if span <= 0:
+            span = 1.0
+        d = (float(a[name]) - float(b[name])) / span
+        total += d * d
+    return math.sqrt(total)
+
+
+def diversify_candidates(ranked, variables, limit, min_distance=0.35):
+    """
+    从代理排序里挑 `limit` 个**彼此分散**的候选（贪心最远点式）。
+
+    为什么需要：`surrogate.suggest()` 的 `next_batch` 只是取排前 3 个，
+    没有去重/分散。若前几名在设计空间里挤成一团（很常见：连续变量只差一点），
+    真实评估就等于在同一小块区域重复烧算力，信息量极低。
+    这里按排序优先、但跳过与已选点太近的候选，让有限的评估次数覆盖更宽。
+
+    **只调整"先算哪些"，不改变任何合格判定** —— 选出来的点仍要各自跑完
+    完整 Study 与强度校核。
+    """
+    picked = []
+    for item in ranked or []:
+        if len(picked) >= limit:
+            break
+        vector = item.get("vector") or {}
+        if any(_normalized_distance(vector, p["vector"], variables) < min_distance
+               for p in picked):
+            continue
+        picked.append(item)
+    # 分散过滤太严导致没选够时，按原排序补齐（宁可少分散也别浪费预算）
+    if len(picked) < limit:
+        chosen = set(id(x) for x in picked)
+        for item in ranked or []:
+            if len(picked) >= limit:
+                break
+            if id(item) not in chosen:
+                picked.append(item)
+    return picked[:limit]
+
+
+def _fit_surrogate(conn, session_id, variables, policy):
+    """
+    在**当前已累积的已评估点**上尝试拟合代理模型。
+
+    返回 (state dict, model dict)。样本不足/拟合出错都归一成 degraded，
+    **不抛异常**（快筛坏了不能拖垮整次优化）。
+    """
+    records = _history_records(conn, session_id)
+    usable, n_excluded = surrogate_mod.usable_points(records)
+    min_samples = surrogate_mod.min_samples_for(variables)
+
+    if len(usable) < min_samples:
+        return _surrogate_state(
+            policy, SURROGATE_WAITING,
+            model={"n_samples": len(usable), "min_samples": min_samples} ,
+            reason="代理模型尚未启用：可用样本 %d 个，拟合至少需要 %d 个"
+                   "（技术故障点已排除 %d 个）"
+                   % (len(usable), min_samples, n_excluded)), None
+
+    # 允许替换拟合实现（测试注入"说谎的代理"用；生产走 surrogate.fit）
+    fit_fn = policy.get("fit") or surrogate_mod.fit
+    try:
+        model = fit_fn(records, variables,
+                       max_mae_ratio=policy["max_mae_ratio"],
+                       max_rmse_ratio=policy["max_rmse_ratio"])
+    except Exception as exc:
+        # 拟合本身出错：降级为不排序，原因原样带出（不静默、不阻塞）
+        return _surrogate_state(
+            policy, SURROGATE_DEGRADED,
+            model={"n_samples": len(usable), "min_samples": min_samples},
+            reason="代理模型拟合失败，已降级为不排序：%s" % (exc,)), None
+
+    if not model.get("available"):
+        # 误差不达标 / 数据不可用：自动降级为不排序，原因**原样**带出来
+        return _surrogate_state(
+            policy, SURROGATE_DEGRADED, model=model,
+            reason=model.get("reason") or "代理模型不可用，已降级为不排序"), None
+
+    return _surrogate_state(policy, SURROGATE_ACTIVE, model=model), model
+
+
+def _prefetch_by_surrogate(conn, session_id, variables, model, policy,
+                           budget, evaluate_vector, seed=0):
+    """
+    用**已可用的**代理模型挑几个点先算（票27 的核心动作）。
+
+    ADR-0002 边界：这里只决定"先算哪些"。每个被挑中的点仍要跑完整 Study +
+    强度校核，合格与否只由实际校核结果决定。代理的预测值仅用于排序，
+    绝不写进任何 `feasible` 字段。
+
+    返回实际预取的点数。
+    """
+    want = int(policy.get("prefetch", 0))
+    if want <= 0:
+        return 0
+
+    points = list_points(conn, session_id)
+    remaining = int(budget.get("max_evals", 0)) - len(points)
+    if remaining <= 0:
+        return 0
+
+    known = set(p["vector_key"] for p in points)
+    pool_size = max(want * 6, 12)
+    pool = []
+    for vector in optimizer.doe_sample(variables, n_samples=pool_size,
+                                       seed=seed):
+        key = optimizer.vector_key(vector)
+        if key in known:
+            continue
+        known.add(key)
+        pool.append({"vector": vector, "key": key})
+
+    suggestion = surrogate_mod.suggest(model, pool)
+    if not suggestion.get("available"):
+        return 0
+
+    limit = max(0, min(want, remaining))
+    chosen = diversify_candidates(suggestion.get("ranking") or [], variables,
+                                  limit)
+
+    n_prefetched = 0
+    for item in chosen:
+        evaluate_vector(item["vector"], SOURCE_SURROGATE)
+        n_prefetched += 1
+    return n_prefetched
+
+
+
+
+
+def _surrogate_state_of(session):
+    """从会话结果快照里取快筛状态；没有记录 = 未启用。"""
+    result = session.get("result") or {}
+    state = result.get("surrogate")
+    if not isinstance(state, dict) or not state:
+        return _surrogate_off_state()
+    return state
+
+
+def surrogate_report(conn, session_id):
+    """
+    查询会话的代理模型快筛状态（汇总口径，可复算）。
+
+    返回 dict：
+      enabled / status   : 是否启用、状态（off/waiting/active/degraded）
+      available          : 模型这一轮是否真的参与排序
+      reason             : 未启用或降级的原因（**不静默**）
+      n_samples / min_samples / n_prefetched
+      model_quality / thresholds : 误差与阈值（可用时）
+      by_source          : {来源: 点数} —— 区分「代理建议」与「确定性搜索」
+    """
+    session = get_session(conn, session_id)
+    state = dict(_surrogate_state_of(session))
+    points = list_points(conn, session_id)
+
+    by_source = {}
+    for p in points:
+        by_source[p["source"]] = by_source.get(p["source"], 0) + 1
+    state["by_source"] = by_source
+    state["n_prefetched"] = by_source.get(SOURCE_SURROGATE, 0)
+    state["n_points"] = len(points)
+    state["text"] = summarize_surrogate(state)
+    return state
+
+
+def summarize_surrogate(state):
+    """人类可读一行摘要（日志 / 报告 / UI 共用）。"""
+    if not state or not state.get("enabled"):
+        return "代理快筛: 未启用（纯确定性搜索）"
+    status = state.get("status")
+    if status == SURROGATE_ACTIVE:
+        q = state.get("model_quality") or {}
+        return ("代理快筛: 已启用并参与排序（样本 %d 个，LOO MAE 占目标跨度 %.1f%%，"
+                "预取 %d 个点优先评估）——只影响评估顺序，合格判定仍以强度校核为准"
+                % (state.get("n_samples", 0), (q.get("mae_ratio") or 0.0) * 100.0,
+                   state.get("n_prefetched", 0)))
+    if status == SURROGATE_DEGRADED:
+        return "代理快筛: 已降级为不排序（%s）" % (state.get("reason") or "原因未说明")
+    if status == SURROGATE_WAITING:
+        return "代理快筛: 等待样本（%s）" % (state.get("reason") or "样本不足")
+    return "代理快筛: 未启用（纯确定性搜索）"
+
+
 
 def summarize(conn, session_id, optimizer_result=None):
     """
@@ -927,6 +1310,17 @@ def summarize(conn, session_id, optimizer_result=None):
                     "n_rounds", "seed"):
             if key in optimizer_result:
                 result[key] = optimizer_result[key]
+
+    # 票27：快筛状态 + 来源区分（代理建议 vs 确定性搜索）
+    surro_state = dict(_surrogate_state_of(session))
+    by_source = {}
+    for p in points:
+        by_source[p["source"]] = by_source.get(p["source"], 0) + 1
+    surro_state["by_source"] = by_source
+    surro_state["n_prefetched"] = by_source.get(SOURCE_SURROGATE, 0)
+    surro_state["n_points"] = len(points)
+    surro_state["text"] = summarize_surrogate(surro_state)
+    result["surrogate"] = surro_state
 
     # 建议采用点：只有"有可行点"时才给建议；没可行点就明确说给不出
     result["recommendation"] = recommendation_from(points, session)
@@ -1214,6 +1608,13 @@ def summarize_text(summary):
         lines.append("最优可行点：无（未找到满足约束的设计）")
     rec = summary.get("recommendation") or {}
     lines.append("建议采用：%s" % (rec.get("text") or "-"))
+    # 票27：快筛在不在起作用，是总结论的一部分（不可静默省略）
+    surro = summary.get("surrogate") or {}
+    lines.append(surro.get("text") or summarize_surrogate(surro))
+    by_source = surro.get("by_source") or {}
+    if by_source:
+        lines.append("点来源：%s" % "，".join(
+            "%s %d" % (k, v) for k, v in sorted(by_source.items())))
     adoption = summary.get("adoption") or summary.get("adoption_text")
     if isinstance(adoption, dict):
         if adoption.get("decided"):
