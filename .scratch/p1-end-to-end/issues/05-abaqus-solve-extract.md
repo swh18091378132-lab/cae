@@ -1,3 +1,5 @@
+> **已发布到 GitHub Issue：** swh18091378132-lab/cae#5（本文件为本地原文/交接要点，工单状态以 GitHub 为准）
+
 # 05: Abaqus 求解与结果抽取（能力库 + 2.6.2 兼容门槛）
 
 **What to build:** 平台用一组可组合的**能力库**函数（几何前处理/网格/材料铺层/载荷边界/求解/抽取）驱动 Abaqus 6.13-4 运行指定分析（P1 首批：静力、模态、屈曲），把 ODB 结果抽取成中性的 CSV/JSON + manifest（element×ply×场量，manifest 记录来源 ODB 指纹、section point 口径、单位），入库并记血缘（inp → odb → 抽取）。所有 Abaqus 侧脚本必须通过 Python 2.6.2 兼容静态检查。
