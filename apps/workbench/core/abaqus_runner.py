@@ -43,9 +43,13 @@ class ExtractResult(object):
 
 
 class AbaqusRunner(object):
-    """协议：真机与 fake 都实现 solve() / extract()。"""
+    """协议：真机与 fake 都实现 solve() / extract()。
 
-    def solve(self, inp_path, job_name, work_dir, step_name=None):
+    票14 起 solve() 增加 `analysis` 参数（分析类型声明 dict 或 None）。
+    **fake 与 real 必须保持同签名**（票14 验收项），宿主侧只传声明，不传代码对象。
+    """
+
+    def solve(self, inp_path, job_name, work_dir, step_name=None, analysis=None):
         raise NotImplementedError
 
     def extract(self, odb_path, out_dir, step_name=None):
@@ -56,19 +60,33 @@ class FakeAbaqusRunner(AbaqusRunner):
     """
     测试用：不调用 Abaqus，直接产出合乎格式的 CSV + manifest。
     可人为制造极值（hotspot）以驱动票 06 校核。
+
+    票14 起支持全部分析类型，且**每种类型的抽取格式完全一致**（同字段同口径），
+    使后续强度校核无需按类型分支；对同一 (n_elems, n_plies, inject_hotspot)
+    与同一分析类型，输出必须**确定性可回归**。
     """
 
     def __init__(self, n_elems=6, n_plies=2, inject_hotspot=True):
         self.n_elems = n_elems
         self.n_plies = n_plies
         self.inject_hotspot = inject_hotspot
+        # 记录最近一次求解用的分析类型，供测试断言"声明确实传到了适配器"
+        self.last_analysis = None
 
-    def solve(self, inp_path, job_name, work_dir, step_name=None):
+    def solve(self, inp_path, job_name, work_dir, step_name=None, analysis=None):
         if not os.path.isdir(work_dir):
             os.makedirs(work_dir)
+        self.last_analysis = analysis
+        kind = (analysis or {}).get("kind", "static")
         odb = os.path.join(work_dir, "%s.odb" % job_name)
         with open(odb, "w", encoding="utf-8") as fh:
             fh.write("FAKE ODB for %s\n" % job_name)
+            fh.write("analysis=%s\n" % kind)
+            if analysis:
+                # 把声明落盘，便于"求解口径可追溯"（真实 Abaqus 也有 .com/.msg）
+                import json as _json
+                fh.write(_json.dumps(analysis, ensure_ascii=False,
+                                     sort_keys=True) + "\n")
         return SolveResult(job_name, odb, "COMPLETED")
 
     def extract(self, odb_path, out_dir, step_name=None):
@@ -76,6 +94,11 @@ class FakeAbaqusRunner(AbaqusRunner):
             os.makedirs(out_dir)
         job = os.path.splitext(os.path.basename(odb_path))[0]
         csv_path = os.path.join(out_dir, "%s_elem_ply.csv" % job)
+
+        # 分析类型只影响 manifest 里的元信息，**不影响 CSV 的字段与口径**：
+        # 这样强度校核（票06）对任何分析类型走同一条代码路径。
+        kind = (self.last_analysis or {}).get("kind", "static")
+
         rows = []
         # 每个单元每一层给一组应力；其中制造一个热点(高应力)供校核捕获
         for e in range(1, self.n_elems + 1):
@@ -105,6 +128,8 @@ class FakeAbaqusRunner(AbaqusRunner):
             "position": "CENTROID",
             "units_note": "fake units MPa",
             "csv": os.path.basename(csv_path),
+            # 票14：分析类型只作为元信息记录，不改抽取口径
+            "analysis_kind": kind,
         }
         man_path = os.path.join(out_dir, "%s_manifest.json" % job)
         with open(man_path, "w", encoding="utf-8") as fh:
@@ -122,6 +147,7 @@ class RealAbaqusRunner(AbaqusRunner):
     def __init__(self, abaqus_path=None, timeout_sec=1800):
         self.abaqus_path = abaqus_path or self._detect()
         self.timeout_sec = timeout_sec
+        self.last_analysis = None
 
     @staticmethod
     def _detect():
@@ -146,13 +172,17 @@ class RealAbaqusRunner(AbaqusRunner):
             out, _ = proc.communicate()
         return proc.returncode, out
 
-    def solve(self, inp_path, job_name, work_dir, step_name=None):
+    def solve(self, inp_path, job_name, work_dir, step_name=None, analysis=None):
         if not os.path.isdir(work_dir):
             os.makedirs(work_dir)
         # 把 inp copy 到工作目录（Abaqus 在 cwd 下产出 .odb/.dat/.msg）
         local_inp = os.path.join(work_dir, os.path.basename(inp_path))
         if os.path.abspath(inp_path) != os.path.abspath(local_inp):
             shutil.copy2(inp_path, local_inp)
+
+        # 分析类型已在 .inp 的分析步里体现（fe_build._step_block），
+        # 故求解命令本身不变；这里记录声明以便追溯。
+        self.last_analysis = analysis
 
         rc, out = self._run(
             ["job=%s" % job_name,

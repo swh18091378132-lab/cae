@@ -192,6 +192,38 @@ class RunOptions(object):
         return base.replace(**(legacy or {}))
 
 
+def _normalize_analysis(analysis):
+    """
+    把 options.analysis 归一成分析类型声明 dict（票14）。
+
+    统一委托给 core/analysis.py —— 分析类型的唯一定义处（宿主侧）；
+    Abaqus 侧 fe_build.py 只消费声明 dict，以保持 Python 2.7 可运行。
+    """
+    try:
+        from . import analysis as analysis_mod
+    except ImportError:
+        import analysis as analysis_mod
+    try:
+        return analysis_mod.normalize(analysis)
+    except Exception as exc:
+        raise StudyRunError("分析类型无效: %s" % exc)
+
+
+def _mesh_quality_artifact_params(fe):
+    """网格质量门（票15）要写进 mesh 产物 params 的字段；未启用则为空。"""
+    q = getattr(fe, "mesh_quality", None) or {}
+    if not q:
+        return {}
+    return {
+        "mesh_quality_enabled": True,
+        "mesh_quality_n_warn_bays": len(q.get("warn_bays") or []),
+        "mesh_quality_n_refined_bays": len(q.get("refined_bays") or []),
+        "mesh_quality_worst_jacobian": q.get("worst", {}).get("jacobian"),
+        "mesh_quality_max_aspect": q.get("worst", {}).get("aspect_ratio"),
+        "mesh_quality_max_warp": q.get("worst", {}).get("warp"),
+    }
+
+
 def _study_name(study_id, conn):
     """取 Study 名称；查不到则退回 id（报告标题栏用）。"""
     try:
@@ -322,15 +354,17 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         }
         result["topology_model"] = model
 
-    # 5) FE 模型构建 -> 网格 + 铺层 + 载荷/BC -> .inp（票 04）
+    # 5) FE 模型构建 -> 网格 + 铺层 + 载荷/BC -> .inp（票 04；票14 分析类型 / 票15 质量门）
     if with_fe_model:
         if not with_topology:
             raise StudyRunError("构建 FE 模型需要先启用 with_topology")
+        analysis_spec = _normalize_analysis(opts.analysis)
         try:
             fe = fe_model.build_fe_model(
                 model, fe_dir or (os.path.join(params_dir, "fe") if params_dir else "fe"),
                 subdiv_per_bay=subdiv_per_bay, plies=plies,
-                material=material, step=step, load=load)
+                material=material, step=step, load=load,
+                analysis=analysis_spec, mesh_quality=opts.mesh_quality)
         except Exception as exc:
             raise StudyRunError("FE 模型构建失败: %s" % exc)
 
@@ -339,7 +373,8 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             params={"n_nodes": fe.mesh_dict["n_nodes"],
                     "n_elems": fe.mesh_dict["n_elems"],
                     "subdiv_per_bay": subdiv_per_bay,
-                    "n_bays": len(model.bays)},
+                    "n_bays": len(model.bays),
+                    **_mesh_quality_artifact_params(fe)},
             conn=conn)
         link(result["artifacts"]["topology"], mesh_id, conn=conn)
 
@@ -347,6 +382,7 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             study_id, "inp", content_uri=fe.inp_path,
             params={"step": fe.step.get("name"),
                     "step_type": fe.step.get("type"),
+                    "analysis_kind": (analysis_spec or {}).get("kind", "static"),
                     "n_plies": fe.laminate["n_plies"],
                     "total_thickness": fe.laminate["total_thickness"],
                     "load": fe.load},
@@ -363,8 +399,15 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             "inp_path": fe.inp_path,
         }
         result["fe_model"] = fe
+        result["analysis"] = analysis_spec
+        # 网格质量报告（票15）：无质量门时为 None
+        q = getattr(fe, "mesh_quality", None)
+        if q:
+            result["mesh_quality"] = q
+            if q.get("warnings"):
+                result.setdefault("warnings", []).extend(q["warnings"])
 
-    # 6) Abaqus 求解 + 结果抽取（票 05）
+    # 6) Abaqus 求解 + 结果抽取（票 05；票14 分析类型透传到适配器）
     if with_solve:
         if not with_fe_model:
             raise StudyRunError("求解需要先启用 with_fe_model")
@@ -375,7 +418,15 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         if not os.path.isdir(sdir):
             os.makedirs(sdir)
 
+        analysis_spec = result.get("analysis") or _normalize_analysis(opts.analysis)
+        solve_kwargs = {}
+        if analysis_spec:
+            solve_kwargs["analysis"] = analysis_spec
         try:
+            sol = abaqus.solve(fe.inp_path, job_name, sdir, step_name=None,
+                               **solve_kwargs)
+        except TypeError:
+            # 兼容只实现 P1 签名的第三方 runner（协议向后兼容）
             sol = abaqus.solve(fe.inp_path, job_name, sdir, step_name=None)
         except Exception as exc:
             raise StudyRunError("Abaqus 求解失败: %s" % exc)
@@ -385,7 +436,8 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
 
         odb_id = add_artifact(
             study_id, "odb", content_uri=sol.odb_path,
-            params={"job": job_name, "status": sol.status},
+            params={"job": job_name, "status": sol.status,
+                    "analysis_kind": (analysis_spec or {}).get("kind", "static")},
             conn=conn)
         link(result["artifacts"]["inp"], odb_id, conn=conn)
 

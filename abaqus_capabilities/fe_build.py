@@ -64,7 +64,7 @@ def _fmt(v):
 
 
 def write_inp(path, mesh_dict, model_dict, laminate, material, step,
-              load, bc, params):
+              load, bc, params, extents=None, analysis=None):
     """
     写出 Abaqus .inp。
 
@@ -76,22 +76,43 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
     load       : {'type':'pressure'|'tip_force','magnitude':float}
     bc         : {'fix_bay': 'root'} 等
     params     : 参数集（用于坐标缩放）
+    extents    : topology.TopologyModel.extents() —— 参数空间包围盒与物理换算。
+                 **部件族无关**：翼面族的 y=展向、筒段族的 y=轴向，xi 一律乘
+                 xi_scale 换成物理长度。None 时回退到 P1 的 span/c_root 口径。
+    analysis   : 分析类型声明（票14）；None 则按 step 决定分析步。
+
+    坐标系：参数空间 y(纵向) / xi(横向 0..1)。xi 经 xi_scale 线性映射到物理 X，
+    y 直接用物理值作 Y。这样翼面类（展向×弦向）与筒段类（轴向×周向展开）
+    共用同一套坐标约定，Abaqus 侧无需区分部件族。
     """
-    span = float(params["span"])
-    c_root = float(params["c_root"])
+    ext = extents or {}
+    if "y_min" in ext:
+        y_min = float(ext["y_min"])
+        y_max = float(ext["y_max"])
+        xi_min = float(ext["xi_min"])
+        xi_max = float(ext["xi_max"])
+        xi_scale = float(ext.get("xi_scale", 1.0))
+    else:
+        # P1 兼容回退：y 从 0 到 span，xi 乘根弦长
+        y_min, y_max = 0.0, float(params["span"])
+        xi_min, xi_max = 0.0, 1.0
+        xi_scale = float(params["c_root"])
+
+    span = y_max           # 命名沿用 P1：y 方向总长
+    c_root = xi_scale       # 命名沿用 P1：xi 方向的物理尺度
 
     lines = []
     add = lines.append
 
     add("*HEADING")
-    add("CAE platform P1 - wing box")
+    add("CAE platform - %s" % str(model_dict.get("template_id", "part")))
     add("*PREPRINT, ECHO=NO, MODEL=NO, HISTORY=NO, CONTACT=NO")
 
     # ---- 节点 ----
     add("*NODE")
     for n in mesh_dict["nodes"]:
-        # xi(0..1) -> 物理 X；y -> 物理 Y；壳位于平面
-        x = float(n["xi"]) * c_root
+        # xi(参数空间) -> 物理 X；y -> 物理 Y；壳位于平面
+        x = (float(n["xi"]) - xi_min) * c_root
         y = float(n["y"])
         add("%d, %s, %s, 0." % (n["id"], _fmt(x), _fmt(y)))
 
@@ -127,24 +148,20 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
         add("%s, 3, %s, %s"
             % (_fmt(p["thickness"]), material.get("name", "CFRP"), _fmt(p["angle"])))
 
-    # ---- 分析步 ----
-    stype = step.get("type", "static")
-    add("*STEP, NAME=%s" % step.get("name", "Step-1"))
-    if stype == "static":
-        add("*STATIC")
-        add("0.1, 1.0, 1e-05, 1.0")
-    elif stype == "frequency":
-        add("*FREQUENCY")
-        add("%d, , , , ," % int(step.get("n_modes", 10)))
-    elif stype == "buckle":
-        add("*BUCKLE")
-        add("%d, , , , ," % int(step.get("n_modes", 5)))
-    else:
-        add("*STATIC")
-        add("0.1, 1.0, 1e-05, 1.0")
+    # ---- 接触定义（票14）：写在 *STEP 之前（模型数据区） ----
+    for ln in _contact_block(analysis):
+        add(ln)
 
-    # ---- 边界条件：固定根部（y = 0 节点） ----
-    root_nodes = [n["id"] for n in mesh_dict["nodes"] if abs(float(n["y"])) < 1e-9]
+    # ---- 分析步 ----
+    # analysis（票14）优先于 step：不同分析类型在 Abaqus 侧是完全不同的分析步写法。
+    stype, step_block = _step_block(step, analysis, model_dict)
+    add("*STEP, NAME=%s" % step.get("name", "Step-1"))
+    for ln in step_block:
+        add(ln)
+
+    # ---- 边界条件：固定根部（y = y_min 节点） ----
+    root_nodes = [n["id"] for n in mesh_dict["nodes"]
+                  if abs(float(n["y"]) - y_min) < 1e-9]
     if root_nodes:
         add("*BOUNDARY")
         for nid in root_nodes:
@@ -158,9 +175,9 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
         add("*DLOAD")
         add("ALL, P, %s" % _fmt(mag))
     elif ltype == "tip_force":
-        # 尖部（y = span）节点施加展向?  这里施加载荷方向的集中力
+        # 尖部（y = y_max）节点施加载荷方向的集中力
         tip_nodes = [n["id"] for n in mesh_dict["nodes"]
-                     if abs(float(n["y"]) - span) < 1e-9]
+                     if abs(float(n["y"]) - y_max) < 1e-9]
         if tip_nodes:
             add("*CLOAD")
             for nid in tip_nodes:
@@ -187,6 +204,117 @@ def _safe(name):
         else:
             out.append("_")
     return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 分析类型（票14）
+#
+# 设计：分析类型只影响**分析步块**与**接触/非线性定义**；网格、材料、铺层、
+# 载荷/边界完全复用。分析类型也不改变结果抽取格式（ADR-0006）——
+# extract.py 对每种类型都吐同一套 element×ply×field CSV。
+# 本文件在 Abaqus 内置 Python 2.7 执行，故只用 2.7 语法。
+# ---------------------------------------------------------------------------
+
+ANALYSIS_KINDS = ("static", "frequency", "buckle", "contact", "nonlinear",
+                  "explicit")
+
+
+def default_analysis(kind="static"):
+    """返回一个分析类型声明 dict（缺省参数齐备，便于 fake/real 同签名）。"""
+    kind = kind or "static"
+    base = {"kind": kind}
+    if kind == "frequency":
+        base["n_modes"] = 10
+    elif kind == "buckle":
+        base["n_modes"] = 5
+        base["load_factor_span"] = 2.0
+    elif kind == "contact":
+        # 接触对：每个 {'master': elset, 'slave': elset, 'friction': mu}
+        base["contacts"] = []
+        base["nlgeom"] = True
+    elif kind == "nonlinear":
+        base["nlgeom"] = True
+        base["nonlinearity"] = "material"   # material | geometry | both
+        base["max_increments"] = 100
+    elif kind == "explicit":
+        base["time_period"] = 0.01
+        base["mass_scaling"] = 1.0
+        base["n_increments_hint"] = 1000
+    return base
+
+
+def _step_block(step, analysis, model_dict):
+    """
+    产出 (分析步类型, [分析步关键字行])。
+
+    analysis 为 None 时按 step['type'] 走 P1 行为（零回归）。
+    """
+    step = step or {}
+    if analysis:
+        kind = analysis.get("kind", "static")
+    else:
+        kind = step.get("type", "static")
+
+    if kind == "frequency":
+        n = int((analysis or step).get("n_modes", 10))
+        return kind, ["*FREQUENCY", "%d, , , , ," % n]
+    if kind == "buckle":
+        n = int((analysis or step).get("n_modes", 5))
+        return kind, ["*BUCKLE", "%d, , , , ," % n]
+    if kind == "explicit":
+        a = analysis or {}
+        period = a.get("time_period", 0.01)
+        lines = ["*DYNAMIC, EXPLICIT"]
+        lines.append("%s, %s" % (_fmt(period), _fmt(period)))
+        # 质量缩放：给一个稳定时间增量缩放因子，显式分析常用手法
+        if a.get("mass_scaling"):
+            lines.insert(1, "*FIXED MASS SCALING, FACTOR=%s, TYPE=UNIFORM"
+                         % _fmt(a.get("mass_scaling")))
+        return kind, lines
+    if kind == "contact":
+        # 接触分析：静力步 + 几何非线性，接触定义在 *STEP 之前由 _contact_block 写
+        return kind, ["*STATIC", "0.1, 1.0, 1e-05, 1.0", "*NLGEOM"]
+    if kind == "nonlinear":
+        a = analysis or {}
+        lines = ["*STATIC"]
+        max_inc = int(a.get("max_increments", 100))
+        lines.append("0.1, 1.0, 1e-05, 1.0, , %d" % max_inc)
+        if a.get("nlgeom") or a.get("nonlinearity") in ("geometry", "both"):
+            lines.append("*NLGEOM")
+        return kind, lines
+    return "static", ["*STATIC", "0.1, 1.0, 1e-05, 1.0"]
+
+
+def _contact_block(analysis):
+    """
+    产出接触定义行（*SURFACE / *CONTACT PAIR / *SURFACE INTERACTION）。
+
+    接触对写在 *STEP 之前（模型数据），这是 Abaqus 的合法位置。
+    """
+    if not analysis:
+        return []
+    pairs = analysis.get("contacts") or []
+    if not pairs:
+        return []
+
+    lines = []
+    for i, cp in enumerate(pairs, 1):
+        master = _safe(cp.get("master", ""))
+        slave = _safe(cp.get("slave", ""))
+        if not master or not slave:
+            continue
+        mu = float(cp.get("friction", 0.2))
+        lines.append("*SURFACE INTERACTION, NAME=INT-%d" % i)
+        lines.append("*FRICTION")
+        lines.append("%s, 0." % _fmt(mu))
+        lines.append("*SURFACE, TYPE=ELEMENT, NAME=SURF-M%d" % i)
+        lines.append("%s, S%d" % (master, int(cp.get("master_face", 1))))
+        lines.append("*SURFACE, TYPE=ELEMENT, NAME=SURF-S%d" % i)
+        lines.append("%s, S%d" % (slave, int(cp.get("slave_face", 2))))
+        lines.append("*CONTACT PAIR, INTERACTION=INT-%d, TYPE=SURFACE TO SURFACE"
+                     % i)
+        lines.append("SURF-S%d, SURF-M%d" % (i, i))
+    return lines
 
 
 def default_material():

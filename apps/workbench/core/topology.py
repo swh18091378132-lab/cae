@@ -97,13 +97,19 @@ class Bay(object):
 class TopologyModel(object):
     """结构拓扑模型：长桁/肋/自然格/不连续格。"""
 
-    def __init__(self, template_id, params, stringers, ribs, holes, mode=None):
+    def __init__(self, template_id, params, stringers, ribs, holes, mode=None,
+                 physical=None):
         self.template_id = template_id
         self.params = params
         self.stringers = stringers   # [{'xi':, 'y0':, 'y1':}]
         self.ribs = ribs             # [{'y':, 'xi0':, 'xi1':}]
         self.holes = holes           # [{'cy':, 'cxi':}]
         self.mode = mode or DEFAULT_MODE
+        # 物理尺度：y 轴本身就是物理长度（m）；xi 是无量纲 0..1，
+        # 乘 xi_scale 换成物理长度（翼面类=根弦长，筒段类=展开周长）。
+        # 供 FE 建模与网格质量门把参数空间量换算成物理尺寸用。
+        self.physical = physical or {"xi_scale": 1.0, "y_unit": "m",
+                                     "xi_unit": "m"}
         self.bays = []
 
     @property
@@ -114,11 +120,45 @@ class TopologyModel(object):
     def invalid_bays(self):
         return [b for b in self.bays if not b.valid]
 
+    def bounds(self):
+        """参数空间包围盒 (y_min, y_max, xi_min, xi_max)；无格时退回 (0,0,0,1)。"""
+        if not self.bays:
+            return (0.0, 0.0, 0.0, 1.0)
+        y_min = min(b.y0 for b in self.bays)
+        y_max = max(b.y1 for b in self.bays)
+        xi_min = min(b.xi0 for b in self.bays)
+        xi_max = max(b.xi1 for b in self.bays)
+        return (y_min, y_max, xi_min, xi_max)
+
+    def extents(self):
+        """
+        FE 建模需要的物理尺度 dict：
+
+          y_min / y_max / xi_min / xi_max : 参数空间包围盒
+          xi_scale                         : xi → 物理长度 的换算系数
+          y_span / xi_span                 : 物理长度跨度
+
+        让 FE 建模块不必硬编码"翼面族才有 span/c_root"这类假设（票12/13 前提）。
+        """
+        y0, y1, xi0, xi1 = self.bounds()
+        scale = float(self.physical.get("xi_scale", 1.0))
+        return {
+            "y_min": y0, "y_max": y1,
+            "xi_min": xi0, "xi_max": xi1,
+            "xi_scale": scale,
+            "y_span": y1 - y0,
+            "xi_span": (xi1 - xi0) * scale,
+            "y_unit": self.physical.get("y_unit", "m"),
+            "xi_unit": self.physical.get("xi_unit", "m"),
+        }
+
     def to_dict(self):
         return {
             "template_id": self.template_id,
             "topology_mode": self.mode,
             "params": self.params,
+            "physical": self.physical,
+            "extents": self.extents(),
             "n_stringers": len(self.stringers),
             "n_ribs": len(self.ribs),
             "stringers": self.stringers,
@@ -498,6 +538,40 @@ def layout_from_params(params, holes=None, stringer_runout=None,
               partial_ribs=partial_ribs)
 
 
+def physical_from_rule(rule, params, mode=None):
+    """
+    从模板声明推导参数空间的**物理尺度**。
+
+    xi 是无量纲 0..1，换算成物理长度需要一族一个系数：
+
+      * 翼面类（wing_surface）  : xi 沿弦向 → xi_scale = 根弦长 c_root
+      * 筒段类（cylinder_section）: xi 沿周向 → xi_scale = 2π×半径（展开周长）
+
+    模板可用 `topology.physical = {"xi_scale": <数字或参数名>}` 显式覆盖；
+    未声明时按模式走上面的默认。这样 FE 建模与网格质量门不必区分部件族。
+    """
+    rule = rule or {}
+    mode = mode or rule.get("mode", DEFAULT_MODE)
+    pp = rule.get("params") or {}
+    phys = rule.get("physical") or {}
+
+    if "xi_scale" in phys:
+        scale = _resolve_bound(phys["xi_scale"], params, 1.0)
+    elif mode == MODE_CYLINDER_SECTION:
+        radius_key = pp.get("radius", "radius")
+        if radius_key in params:
+            scale = 2.0 * math.pi * float(params[radius_key])
+        else:
+            scale = 1.0
+    else:
+        chord_key = pp.get("c_root", "c_root")
+        scale = float(params[chord_key]) if chord_key in params else 1.0
+
+    return {"xi_scale": scale,
+            "y_unit": phys.get("y_unit", "m"),
+            "xi_unit": phys.get("xi_unit", "m")}
+
+
 def build_topology(template_id, params, holes=None, stringer_runout=None,
                    partial_ribs=None, template=None, templates_dir=None,
                    rule=None):
@@ -519,8 +593,9 @@ def build_topology(template_id, params, holes=None, stringer_runout=None,
     stringers, ribs, holes_abs = layout_from_params(
         params, holes=holes, stringer_runout=stringer_runout,
         partial_ribs=partial_ribs, rule=rule)
+    mode = rule.get("mode", DEFAULT_MODE)
     t = TopologyModel(template_id, params, stringers, ribs, holes_abs,
-                      mode=rule.get("mode", DEFAULT_MODE))
+                      mode=mode, physical=physical_from_rule(rule, params, mode))
     t.bays = build_bays(stringers, ribs, holes_abs)
     return t
 

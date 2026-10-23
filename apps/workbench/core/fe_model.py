@@ -42,7 +42,8 @@ def _import_fe_build():
 
 
 def build_fe_model(topology_model, out_dir, subdiv_per_bay=4,
-                   plies=None, material=None, step=None, load=None):
+                   plies=None, material=None, step=None, load=None,
+                   analysis=None, mesh_quality=None):
     """
     由结构拓扑模型构建 FE 模型并写出 .inp。
 
@@ -52,6 +53,8 @@ def build_fe_model(topology_model, out_dir, subdiv_per_bay=4,
     material       : 材料参数；None 则默认 CFRP
     step           : {'name','type'}；默认静力
     load           : {'type','magnitude'}；默认面压
+    analysis       : 分析类型声明（票14）；None 则沿用静力默认
+    mesh_quality   : 网格质量门策略（票15）；None 则不启用
 
     返回 FeModel
     """
@@ -75,6 +78,7 @@ def build_fe_model(topology_model, out_dir, subdiv_per_bay=4,
     inp_path = os.path.join(out_dir, "model.inp")
 
     fb.write_inp(inp_path, mesh.to_dict(), topology_model.to_dict(),
-                 laminate, mat, st, ld, {}, topology_model.params)
+                 laminate, mat, st, ld, {}, topology_model.params,
+                 topology_model.extents(), analysis)
 
     return FeModel(mesh, mesh.to_dict(), inp_path, laminate, st, ld)
