@@ -1,20 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-ui_workbench.py -- 本地工程工作台 UI（票 08 / 票 19）
+ui_workbench.py -- 本地工程工作台 UI（票 08 / 票 19 / 票 28）
 
 Tkinter 最小实现（Win7 无浏览器依赖）。**只调用 workbench_service**，
 自身不含编排逻辑，便于把可测逻辑留在服务层。
 
-布局（票19 起分两个标签页，原有布局与功能保持不变）：
+布局（票19 起分标签页，原有布局与功能保持不变；票28 再增一页）：
   「分析」页
     左：模板选择 + 参数输入 + 运行按钮 + 已有分析任务
     右上：运行日志
     右下：血缘树 + 报告按钮
-  「审批与型号汇总」页（票19 新增）
+  「审批与型号汇总」页（票19）
     上：角色切换（审核 / 签发 / 设计 / 强度分析）+ 刷新
     左：待办列表（按角色区分：待审 / 待签 / 已退回）+ 型号汇总视图
     右：审核详情（血缘 + 校核明细 + 审批历史）+ 通过 / 退回 / 签发
     签发按钮**只对已通过审核的报告可用**（不满足时置灰并在提示里说明原因）。
+  「优化」页（票28）
+    上：角色切换（只有签发角色可决策）+ 刷新 + **采用门控提示**
+    左：优化会话列表 + 设计点列表（分组前缀区分 可行/不可行/评估失败）
+    右上：汇总视图 + 优化前后对比
+    右下：设计点详情（完整血缘 + 校核明细）
+    采用 / 维持原设计按钮**由服务层的 (ok, reason) 决定可用性** —— UI 不复制权限表，
+    于是"置灰"与"被拒绝"永远说的是同一句话。
 
 兼容 Python 3.8。
 """
@@ -46,6 +53,11 @@ ROLE_CHOICES = (
     ("analysis", "强度分析（已退回）"),
 )
 
+# 优化页的角色下拉项（票28）：只有签发角色能采用/维持原设计。
+# 直接复用服务层的定义——**角色权限表不许在 UI 里复制一份**，否则两处迟早不一致。
+OPT_ROLE_CHOICES = tuple(
+    (role, name) for role, name in _ws.OPTIMIZE_ROLE_CHOICES)
+
 
 class WorkbenchApp(object):
     def __init__(self, root, service):
@@ -61,8 +73,14 @@ class WorkbenchApp(object):
         self._review_detail = None
         self._model_ids = []
 
-        root.title("CAE 结构设计分析工作台 — P2")
-        root.geometry("1180x760")
+        # 优化页状态（票28）
+        self.opt_role_var = None
+        self._opt_sessions = []
+        self._opt_summary = None
+        self._opt_point = None
+
+        root.title("CAE 结构设计分析工作台 — P3")
+        root.geometry("1240x800")
 
         self._build_ui()
         self._poll_queue()
@@ -70,7 +88,7 @@ class WorkbenchApp(object):
     # ---------------- UI 构建 ----------------
 
     def _build_ui(self):
-        """顶层 Notebook：保留原「分析」页，新增「审批与型号汇总」页。"""
+        """顶层 Notebook：保留「分析」页与「审批与型号汇总」页，新增「优化」页。"""
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
@@ -82,11 +100,16 @@ class WorkbenchApp(object):
         self.notebook.add(self.approval_tab, text="审批与型号汇总")
         self._build_approval_tab(self.approval_tab)
 
+        self.optimization_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.optimization_tab, text="优化")
+        self._build_optimization_tab(self.optimization_tab)
+
         self._load_templates()
         self._refresh_studies()
         self._refresh_models()
         self.on_refresh_inbox()
         self.on_refresh_rollup()
+        self.on_refresh_optimization()
 
     def _build_analysis_tab(self, parent):
         main = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
@@ -447,6 +470,281 @@ class WorkbenchApp(object):
             return
         self.rollup_text.insert(tk.END, overview.get("text") or "")
 
+
+    # ---------------- 优化页（票28） ----------------
+
+    def _build_optimization_tab(self, parent):
+        """
+        优化汇总视图：会话列表 + 汇总视图 + 设计点血缘 + 采用 / 维持原设计。
+
+        布局与审批页同构（左列表 / 右详情），因为项目负责人的工作方式是同一套：
+        先在一堆会话里挑一个，再看清它的结论，最后做一个决定。
+        """
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X, padx=6, pady=(6, 2))
+        ttk.Label(top, text="当前角色").pack(side=tk.LEFT)
+        self.opt_role_var = tk.StringVar(value=OPT_ROLE_CHOICES[0][1])
+        self.opt_role_combo = ttk.Combobox(
+            top, textvariable=self.opt_role_var, state="readonly", width=26,
+            values=[c[1] for c in OPT_ROLE_CHOICES])
+        self.opt_role_combo.pack(side=tk.LEFT, padx=6)
+        self.opt_role_combo.bind("<<ComboboxSelected>>",
+                                 lambda e: self.on_opt_role_change())
+        ttk.Button(top, text="刷新会话", command=self.on_refresh_optimization).pack(
+            side=tk.LEFT, padx=4)
+        # 采用门控提示：写清"为什么现在不能采用"（判据来自服务层）
+        self.opt_gate_hint = ttk.Label(top, text="", foreground="#8a5a00")
+        self.opt_gate_hint.pack(side=tk.LEFT, padx=12)
+
+        body = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        # 左：会话列表 + 设计点列表
+        left = ttk.PanedWindow(body, orient=tk.VERTICAL)
+        body.add(left, weight=1)
+
+        sess_frame = ttk.LabelFrame(left, text="优化会话")
+        left.add(sess_frame, weight=1)
+        # exportselection=False：两个列表各自保留选中项。
+        # 默认 True 时 Tk 的选中区是**全局互斥**的 —— 点设计点会清掉会话的选中，
+        # 于是"当前会话"变成 None，采用按钮莫名其妙地置灰。
+        self.opt_session_list = tk.Listbox(sess_frame, height=8,
+                                           exportselection=False)
+        self.opt_session_list.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.opt_session_list.bind(
+            "<<ListboxSelect>>", lambda e: self.on_opt_session_select())
+
+        point_frame = ttk.LabelFrame(left, text="设计点（可行 / 不可行 / 评估失败）")
+        left.add(point_frame, weight=1)
+        self.opt_point_list = tk.Listbox(point_frame, height=12,
+                                         exportselection=False)
+        self.opt_point_list.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.opt_point_list.bind(
+            "<<ListboxSelect>>", lambda e: self.on_opt_point_select())
+
+        # 右：汇总/对比 + 设计点详情 + 决策按钮
+        right = ttk.PanedWindow(body, orient=tk.VERTICAL)
+        body.add(right, weight=2)
+
+        act = ttk.Frame(right)
+        act.pack(fill=tk.X, padx=4, pady=(4, 0))
+        self.btn_adopt_opt = ttk.Button(act, text="采用该方案…",
+                                        command=self.on_adopt_point)
+        self.btn_adopt_opt.pack(side=tk.LEFT)
+        self.btn_keep_opt = ttk.Button(act, text="维持原设计",
+                                       command=self.on_keep_original)
+        self.btn_keep_opt.pack(side=tk.LEFT, padx=6)
+        ttk.Button(act, text="刷新汇总与对比",
+                   command=self.on_refresh_optimization).pack(side=tk.LEFT, padx=18)
+
+        sum_frame = ttk.LabelFrame(right, text="汇总与优化前后对比")
+        right.add(sum_frame, weight=1)
+        self.opt_summary = tk.Text(sum_frame, height=14, wrap="none")
+        self.opt_summary.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        det_frame = ttk.LabelFrame(right, text="设计点详情（血缘 + 校核明细）")
+        right.add(det_frame, weight=1)
+        self.opt_detail = tk.Text(det_frame, height=14, wrap="none")
+        self.opt_detail.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._update_opt_buttons()
+
+    # ---------------- 优化页数据加载（票28） ----------------
+
+    def _opt_role_key(self):
+        """优化页角色下拉显示名 -> 角色键（签发 / 设计 / 审核 / 强度分析）。"""
+        text = self.opt_role_var.get() if self.opt_role_var is not None else ""
+        for key, name in OPT_ROLE_CHOICES:
+            if name == text:
+                return key
+        return OPT_ROLE_CHOICES[0][0]
+
+    def on_opt_role_change(self):
+        """切换角色：只影响按钮可用性与提示，不改数据（数据来自服务层）。"""
+        self._update_opt_buttons()
+
+    def on_refresh_optimization(self):
+        """刷新会话列表 / 汇总 / 对比 / 设计点列表（全部来自服务层）。"""
+        # ---- 会话列表 ----
+        self.opt_session_list.delete(0, tk.END)
+        self._opt_sessions = []
+        try:
+            rows = self.svc.list_optimization_sessions()
+        except Exception as exc:
+            self._log("加载优化会话失败: %s" % exc)
+            rows = []
+        for row in rows:
+            self._opt_sessions.append(row)
+            self.opt_session_list.insert(
+                tk.END, row.get("label") or row.get("session_id"))
+
+        self.opt_point_list.delete(0, tk.END)
+        self._opt_summary = None
+        self._opt_point = None
+        self.opt_summary.delete("1.0", tk.END)
+        self.opt_detail.delete("1.0", tk.END)
+
+        if not self._opt_sessions:
+            self.opt_summary.insert(tk.END, "（尚无优化会话）")
+            self._update_opt_buttons()
+            return
+
+        # 默认选中第一个会话（保持既有交互习惯：打开就有内容）
+        if not self.opt_session_list.curselection():
+            self.opt_session_list.selection_set(0)
+        self.on_opt_session_select()
+
+    def _selected_opt_session_id(self):
+        sel = self.opt_session_list.curselection()
+        if not sel or sel[0] >= len(self._opt_sessions):
+            return None
+        return self._opt_sessions[sel[0]].get("session_id")
+
+    def on_opt_session_select(self):
+        """选中会话 -> 拉汇总 + 对比 + 设计点列表。"""
+        sid = self._selected_opt_session_id()
+        if not sid:
+            return
+        self.opt_point_list.delete(0, tk.END)
+        self._opt_point = None
+        self.opt_detail.delete("1.0", tk.END)
+        try:
+            summary = self.svc.get_optimization_summary(sid)
+        except ServiceError as exc:
+            self._opt_summary = None
+            self.opt_summary.delete("1.0", tk.END)
+            self.opt_summary.insert(tk.END, "加载优化汇总失败: %s" % exc)
+            self._update_opt_buttons()
+            return
+
+        self._opt_summary = summary
+        try:
+            cmp_text = self.svc.format_optimization_comparison(sid)
+        except ServiceError as exc:
+            cmp_text = "对比不可用: %s" % exc
+
+        self.opt_summary.delete("1.0", tk.END)
+        self.opt_summary.insert(
+            tk.END, (summary.get("text") or "") + "\n\n" + cmp_text)
+
+        # 三组一起列，但**分组前缀在 label 里**，于是"算不出来"不会被读成"很差"
+        for p in summary.get("points") or []:
+            self.opt_point_list.insert(tk.END, p.get("label") or
+                                       "#%s" % p.get("point_id"))
+        if summary.get("points"):
+            self.opt_point_list.selection_set(0)
+            self.on_opt_point_select()
+        self._update_opt_buttons()
+
+    def on_opt_point_select(self):
+        """选中设计点 -> 展示完整血缘（"这个数是怎么来的"）。"""
+        sid = self._selected_opt_session_id()
+        sel = self.opt_point_list.curselection()
+        if not sid or not sel:
+            return
+        points = (self._opt_summary or {}).get("points") or []
+        if sel[0] >= len(points):
+            return
+        pid = points[sel[0]]["point_id"]
+        try:
+            detail = self.svc.get_optimization_point_lineage(sid, pid)
+        except ServiceError as exc:
+            self._opt_point = None
+            self.opt_detail.delete("1.0", tk.END)
+            self.opt_detail.insert(tk.END, str(exc))
+            return
+        self._opt_point = detail
+        self.opt_detail.delete("1.0", tk.END)
+        self.opt_detail.insert(tk.END, detail.get("text") or "")
+        self._update_opt_buttons()
+
+    def _update_opt_buttons(self):
+        """
+        按"服务层给出的 (ok, reason)"决定采用/维持原设计按钮的可用性。
+
+        这是票28 的核心门控之一：**UI 只是消费服务层判定**，不复制权限表。
+        两层的判据因此永远一致 —— 置灰与拒绝说的是同一句话。
+        """
+        sid = self._selected_opt_session_id()
+        role = self._opt_role_key()
+        if not sid:
+            for btn in (self.btn_adopt_opt, self.btn_keep_opt):
+                btn.config(state=tk.DISABLED)
+            if self.opt_gate_hint is not None:
+                self.opt_gate_hint.config(text="（请先选择一个优化会话）")
+            return
+
+        can_adopt, adopt_reason = self.svc.can_adopt_optimization(sid, role=role)
+        can_keep, keep_reason = self.svc.can_keep_original(sid, role=role)
+        self.btn_adopt_opt.config(
+            state=(tk.NORMAL if can_adopt else tk.DISABLED))
+        self.btn_keep_opt.config(
+            state=(tk.NORMAL if can_keep else tk.DISABLED))
+
+        hint = ""
+        if not can_adopt:
+            hint = adopt_reason or ""
+        elif self._opt_point and self._opt_point.get("is_best") is not True:
+            # 可以采用，但要提醒：默认采用点是"建议的最优可行点"，不是当前选中的点
+            hint = "（将采用建议的最优可行点；如要指定其它点请先选中它）"
+        if hint and self.opt_gate_hint is not None:
+            self.opt_gate_hint.config(text=hint)
+        elif self.opt_gate_hint is not None:
+            self.opt_gate_hint.config(text="")
+
+    # ---------------- 优化决策（票28：L2 人决策门） ----------------
+
+    def on_adopt_point(self):
+        """采用优化方案：先问理由，再交给服务层（服务层是合规边界）。"""
+        sid = self._selected_opt_session_id()
+        if not sid:
+            return
+        role = self._opt_role_key()
+        ok, reason = self.svc.can_adopt_optimization(sid, role=role)
+        if not ok:
+            messagebox.showwarning("不能采用", reason)
+            return
+        rationale = self._ask_text(
+            "采用优化方案",
+            "采用理由（建议填写：为什么选这一点，改进幅度是否值得改型）：")
+        if rationale is None:
+            return
+        # 采用哪个点：用户选中的点优先，否则用建议点
+        pid = None
+        if self._opt_point is not None:
+            pid = self._opt_point.get("point_id")
+        try:
+            state = self.svc.adopt_optimization_point(
+                sid, pid, role=role, rationale=rationale or None)
+        except ServiceError as exc:
+            messagebox.showerror("采用失败", str(exc))
+            return
+        self._log("已采用优化方案：会话 %s 设计点 #%s（%s）"
+                  % (sid, state.get("point_id"), state.get("actor")))
+        self.on_refresh_optimization()
+
+    def on_keep_original(self):
+        """维持原设计：一等决策，同样留痕。"""
+        sid = self._selected_opt_session_id()
+        if not sid:
+            return
+        role = self._opt_role_key()
+        ok, reason = self.svc.can_keep_original(sid, role=role)
+        if not ok:
+            messagebox.showwarning("不能维持原设计", reason)
+            return
+        rationale = self._ask_text(
+            "维持原设计",
+            "理由（建议填写：为何不改，例如改进不足 / 评估全部失败）：")
+        if rationale is None:
+            return
+        try:
+            state = self.svc.keep_original_design(
+                sid, role=role, rationale=rationale or None)
+        except ServiceError as exc:
+            messagebox.showerror("操作失败", str(exc))
+            return
+        self._log("已决定维持原设计：会话 %s（%s）" % (sid, state.get("actor")))
+        self.on_refresh_optimization()
 
     # ---------------- 数据加载 ----------------
 
