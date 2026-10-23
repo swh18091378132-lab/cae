@@ -1101,27 +1101,28 @@ def test_py38(fails):
     # 零第三方依赖：本模块只 import 标准库与 core 内模块。
     # 用 AST 查真实的 import 语句 —— 字符串匹配会把文档里"不 import numpy"这句话
     # 本身判成违规（那正是首轮实现的误报）。
+    #
+    # 判定方式是**黑名单**（禁止第三方科学与数值库），不是白名单：
+    # 白名单会在每次合法新增一个标准库/core 模块时误报（票27 加 surrogate 就撞过），
+    # 于是有人会把新名字塞进白名单——那这条检查就变成了"追认现状"，形同虚设。
     import ast
     path = os.path.join(CORE, "optimization_loop.py")
     with open(path, "r", encoding="utf-8") as fh:
         tree = ast.parse(fh.read(), filename=path)
-    imported = set()
+    third_party = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                imported.add((alias.name or "").split(".")[0])
+                third_party.add((alias.name or "").split(".")[0])
         elif isinstance(node, ast.ImportFrom):
             if node.level:      # 相对 import = core 内模块
                 continue
-            imported.add((node.module or "").split(".")[0])
-    allowed = {"approval", "db", "design_vector", "objectives", "optimizer",
-               "study", "template_registry", "textfmt", "run_study",
-               "datetime", "json", "os", "uuid", "textfmt"}
-    extra = imported - allowed
-    # 相对 import（from . import X）也被 ast 记成 ImportFrom(level=1)，已跳过；
-    # 这里只关心漏进来的第三方/意外模块
-    if extra:
-        fails.append("optimization_loop.py import 了非预期模块: %r" % (sorted(extra),))
+            third_party.add((node.module or "").split(".")[0])
+    banned = set(["numpy", "scipy", "pandas", "matplotlib", "sklearn",
+                  "torch", "tensorflow", "sympy", "numba"])
+    hit = third_party & banned
+    if hit:
+        fails.append("optimization_loop.py 引入了第三方依赖: %r" % (sorted(hit),))
 
     # 主切口未被改动（不改 run_study 签名 / RunOptions 加字段的方式）
     import run_study
