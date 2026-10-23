@@ -29,6 +29,9 @@ from criteria import DEFAULT_ALLOWABLES
 
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
 
+# 渲染期选项（由 render_report 设置），用于规模保护等
+_REPORT_OPTIONS = {}
+
 TABLE_PLACEHOLDERS = ("param_table", "detail_table", "hotspot_table",
                       "invalid_bay_table", "artifact_table")
 IMAGE_PLACEHOLDERS = ("hotspot_figure",)
@@ -194,7 +197,16 @@ def render_report(*args, **kwargs):
     支持两种调用形式（票 07 约定的在前）：
         render_report(study_id, context, template_path, out_path)
         render_report(context, template_path, out_path)      # 兼容旧调用
+
+    可选 report_options（关键字）：
+        detail_table_max_rows : 明细表最大行数（0/None = 不限）。真实算例明细可达
+                                几十万行，全灌入 docx 会撑爆；超出时保留 FI 最高者
+                                并在表尾注明，全量仍见 check_detail.csv。
     """
+    global _REPORT_OPTIONS
+    opts = kwargs.pop("report_options", None)
+    _REPORT_OPTIONS = opts or {}
+
     if len(args) >= 4:
         study_id, context, template_path, out_path = args[:4]
     elif len(args) == 3:
@@ -327,13 +339,23 @@ def _insert_table_at(doc, para, key, data, warnings):
                          _fmt(h.get("FI")), _fmt(h.get("MS"))))
     elif key == "detail_table":
         # 校核明细表（单元 × 铺层 × 准则），FI 降序便于审阅
+        # 规模保护：真实算例可达几十万行，全灌进 docx 会撑爆。
+        # 可通过 report_options.detail_table_max_rows 设上限（0/None = 不限）。
         rows = [("单元", "铺层", "准则", "FI", "MS", "判定")]
         items = sorted(data or [], key=lambda r: -(r.get("FI") or 0.0))
+        limit = int((_REPORT_OPTIONS or {}).get("detail_table_max_rows") or 0)
+        truncated = 0
+        if limit > 0 and len(items) > limit:
+            truncated = len(items) - limit
+            items = items[:limit]
         for r in items:
             rows.append((str(r.get("elem")), str(r.get("sp")),
                          str(r.get("criterion")),
                          _fmt(r.get("FI")), _fmt(r.get("MS")),
                          "合格" if r.get("pass") else "不合格"))
+        if truncated:
+            rows.append(("…", "…", "…", "…", "…",
+                         "另有 %d 行未列出（全量见 check_detail.csv）" % truncated))
     elif key == "artifact_table":
         # 产物与指纹清单：报告内容可追溯到具体版本
         rows = [("产物", "版本", "指纹(sha256)", "位置")]
