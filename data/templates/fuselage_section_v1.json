@@ -1,0 +1,27 @@
+{
+  "id": "fuselage_section_v1",
+  "name": "机身筒段 v1（框 × 桁条，闭口含接缝）",
+  "description": "P2 第二个结构部件族：筒段类。框沿轴向等分、桁条沿周向等分，自然格由「框 × 桁条」围合；筒段为闭口，周向首尾由接缝处补一根桁条闭合。铺层不在此定义（铺层作 CAE 属性，ADR-0005）。",
+  "parameters": [
+    {"name": "length",          "type": "float", "min": 1.0, "max": 30.0, "default": 6.0,   "unit": "m", "map": "筒段轴向长度"},
+    {"name": "radius",          "type": "float", "min": 0.5, "max": 4.0,  "default": 1.5,   "unit": "m", "map": "筒段半径（蒙皮中面）"},
+    {"name": "n_frames",        "type": "int",   "min": 2,   "max": 40,   "default": 4,     "unit": "",  "map": "框位数(含前后两端的框)"},
+    {"name": "n_stringers",     "type": "int",   "min": 4,   "max": 60,   "default": 8,     "unit": "",  "map": "桁条数(周向等分数；闭口含接缝共 n+1 根)"},
+    {"name": "hole_axial_frac", "type": "float", "min": 0.0, "max": 1.0,  "default": 0.5,   "unit": "",  "map": "蒙皮开口轴向位置（0=前端框，1=后端框；沿轴长分数）"},
+    {"name": "hole_circ_frac",  "type": "float", "min": 0.0, "max": 1.0,  "default": 0.5625,"unit": "",  "map": "蒙皮开口周向位置（0/1=接缝，沿周向分数）"},
+    {"name": "hole_enabled",    "type": "int",   "min": 0,   "max": 1,    "default": 1,     "unit": "",  "map": "蒙皮开口开关(1=有开口，0=无开口)"}
+  ],
+  "envelope": {
+    "note": "参数化包络：在以下约束内改参免重建模板；超出则触发换模板。开口位置以「沿轴向分数 × 沿周向分数」表达，映射为 topology 的 holes（cy / cxi），因此两类部件族的不连续格判据完全一致。",
+    "constraints": [
+      "length / max(n_frames - 1, 1) >= 0.3",
+      "(2 * 3.14159265358979 * radius) / max(n_stringers, 1) >= 0.08"
+    ]
+  },
+  "topology": {
+    "mode": "cylinder_section",
+    "note": "筒段类布置（票11 策略化的第二个模式）：框(等 y 线, y=轴向) × 桁条(等 xi 线, xi=周向 0..1)。自然格数 = (n_frames-1) × n_stringers；闭口接缝在 xi=1 处补一根桁条。physical.xi_scale 由 radius 推出 = 2πr（周向展开长度），故 FE 与网格质量门无需区分部件族。开口落在某格内部则判该格不连续（cutout）。",
+    "params": {"axial": "length", "n_frames": "n_frames", "n_stringers": "n_stringers", "radius": "radius"}
+  },
+  "template_file": "data/templates/fuselage_section_v1.CATPart"
+}
