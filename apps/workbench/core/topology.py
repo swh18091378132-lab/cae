@@ -213,6 +213,67 @@ def build_bays(stringers, ribs, holes=None):
     return bays
 
 
+def _resolve_bound(spec, params, default):
+    """
+    把模板 `ranges` 里的一个端点解析成数值。
+
+    spec 可以是：
+      * None            -> 用 default
+      * 数字            -> 直接用
+      * 参数名字符串    -> 取 params[名字]
+      * {"param": "..."} / {"value": 0.3}  -> 显式形式
+    """
+    if spec is None:
+        return float(default)
+    if isinstance(spec, bool):
+        raise TopologyError("ranges 端点不能是布尔值: %r" % (spec,))
+    if isinstance(spec, (int, float)):
+        return float(spec)
+    if isinstance(spec, str):
+        if spec not in params:
+            raise TopologyError("ranges 端点引用参数 %r，但参数集里只有 %s"
+                                % (spec, ", ".join(sorted(params))))
+        return float(params[spec])
+    if isinstance(spec, dict):
+        if "param" in spec:
+            return _resolve_bound(spec["param"], params, default)
+        if "value" in spec:
+            return float(spec["value"])
+    raise TopologyError("无法解析 ranges 端点: %r" % (spec,))
+
+
+def _resolve_ranges(rule, params, y_default, xi_default):
+    """
+    解析模板声明的参数空间子区间（票12/13 用）。
+
+    翼面类/筒段类的默认区间都是 y: [0, 全长] 与 xi: [0, 1]；某些部件族只占其中一段
+    （例：尾翼盒段只取前后梁之间的弦向段），于是模板声明::
+
+        "topology": {
+          "mode": "wing_surface",
+          "ranges": {"xi": {"from": "spar_front_frac", "to": "spar_rear_frac"}}
+        }
+
+    未声明时两端都用默认值 —— 这正是 P1 机翼盒段的规则，故零回归。
+    """
+    ranges = (rule or {}).get("ranges") or {}
+    if not isinstance(ranges, dict):
+        raise TopologyError("模板 topology.ranges 应为对象，实际 %r" % (ranges,))
+
+    y_rng = ranges.get("y") or {}
+    xi_rng = ranges.get("xi") or {}
+    y0 = _resolve_bound(y_rng.get("from"), params, y_default[0])
+    y1 = _resolve_bound(y_rng.get("to"), params, y_default[1])
+    xi0 = _resolve_bound(xi_rng.get("from"), params, xi_default[0])
+    xi1 = _resolve_bound(xi_rng.get("to"), params, xi_default[1])
+
+    if not y1 > y0:
+        raise TopologyError("拓扑 y 区间不成立: [%r, %r]" % (y0, y1))
+    if not xi1 > xi0:
+        raise TopologyError("拓扑 xi 区间不成立: [%r, %r]" % (xi0, xi1))
+    return (y0, y1), (xi0, xi1)
+
+
 # ---------------------------------------------------------------------------
 # 布置规则：翼面类（长桁 × 肋）
 # ---------------------------------------------------------------------------
@@ -245,17 +306,21 @@ def _layout_wing_surface(params, rule=None, holes=None, stringer_runout=None,
     n_ribs = int(params[ribs_key])
     n_str = int(params[str_key])
 
+    # 参数空间子区间：未声明则为 y[0,全长] × xi[0,1]（= P1 机翼盒段规则）
+    (y0, y1), (xi_lo, xi_hi) = _resolve_ranges(
+        rule, params, (0.0, span), (0.0, 1.0))
+
     # 肋：n_ribs 根（含两端），展向等分布置
     ribs = []
     for k in range(n_ribs):
-        y = span * k / float(n_ribs - 1) if n_ribs > 1 else 0.0
-        ribs.append({"y": y, "xi0": 0.0, "xi1": 1.0})
+        y = y0 + (y1 - y0) * k / float(n_ribs - 1) if n_ribs > 1 else y0
+        ribs.append({"y": y, "xi0": xi_lo, "xi1": xi_hi})
 
-    # 长桁：n_stringers 根（含前后梁），弦向 0..1 等分
+    # 长桁：n_stringers 根（含前后梁），弦向等分
     stringers = []
     for k in range(n_str):
-        xi = k / float(n_str - 1) if n_str > 1 else 0.0
-        stringers.append({"xi": xi, "y0": 0.0, "y1": span})
+        xi = xi_lo + (xi_hi - xi_lo) * k / float(n_str - 1) if n_str > 1 else xi_lo
+        stringers.append({"xi": xi, "y0": y0, "y1": y1})
 
     # 施加人为不连续（用于回归测试/真实缺陷建模）
     if stringer_runout:
@@ -266,11 +331,12 @@ def _layout_wing_surface(params, rule=None, holes=None, stringer_runout=None,
             ribs[int(idx)]["xi0"] = float(rng[0])
             ribs[int(idx)]["xi1"] = float(rng[1])
 
+    # 开口位置：cy 是**沿 y 的分数**（0=起点，1=终点），cxi 是沿 xi 的分数
     holes_abs = []
     if holes:
         for h in holes:
-            holes_abs.append({"cy": float(h["cy"]) * span,
-                              "cxi": float(h["cxi"])})
+            holes_abs.append({"cy": y0 + float(h["cy"]) * (y1 - y0),
+                              "cxi": xi_lo + float(h["cxi"]) * (xi_hi - xi_lo)})
 
     stringers.sort(key=lambda s: s["xi"])
     ribs.sort(key=lambda r: r["y"])
@@ -318,20 +384,25 @@ def _layout_cylinder_section(params, rule=None, holes=None, stringer_runout=None
     n_frames = int(params[frames_key])
     n_str = int(params[str_key])
 
+    # 参数空间子区间：未声明则为 y[0,全长] × xi[0,1]（整圈周向）
+    (y0, y1), (xi_lo, xi_hi) = _resolve_ranges(
+        rule, params, (0.0, length), (0.0, 1.0))
+
     # 框：n_frames 根（含两端），轴向等分
     ribs = []
     for k in range(n_frames):
-        y = length * k / float(n_frames - 1) if n_frames > 1 else 0.0
-        ribs.append({"y": y, "xi0": 0.0, "xi1": 1.0})
+        y = y0 + (y1 - y0) * k / float(n_frames - 1) if n_frames > 1 else y0
+        ribs.append({"y": y, "xi0": xi_lo, "xi1": xi_hi})
 
-    # 桁条：n_str 根，周向（xi 0..1）等分；筒段是**闭口**，故首尾同线
+    # 桁条：n_str 根，周向等分；筒段是**闭口**，故首尾同线
     stringers = []
+    span_xi = xi_hi - xi_lo
     for k in range(n_str):
-        xi = k / float(n_str) if n_str > 0 else 0.0
-        stringers.append({"xi": xi, "y0": 0.0, "y1": length})
+        xi = xi_lo + span_xi * k / float(n_str) if n_str > 0 else xi_lo
+        stringers.append({"xi": xi, "y0": y0, "y1": y1})
     # 闭口：补上接缝那一根，使周向最后一段也由两根桁条围合
     if n_str > 0:
-        stringers.append({"xi": 1.0, "y0": 0.0, "y1": length})
+        stringers.append({"xi": xi_hi, "y0": y0, "y1": y1})
 
     if stringer_runout:
         for idx, y_end in stringer_runout.items():
@@ -344,8 +415,8 @@ def _layout_cylinder_section(params, rule=None, holes=None, stringer_runout=None
     holes_abs = []
     if holes:
         for h in holes:
-            holes_abs.append({"cy": float(h["cy"]) * length,
-                              "cxi": float(h["cxi"])})
+            holes_abs.append({"cy": y0 + float(h["cy"]) * (y1 - y0),
+                              "cxi": xi_lo + float(h["cxi"]) * span_xi})
 
     stringers.sort(key=lambda s: s["xi"])
     ribs.sort(key=lambda r: r["y"])
