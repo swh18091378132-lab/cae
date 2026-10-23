@@ -20,6 +20,7 @@ try:
     from . import template_registry
     from . import run_study as rs_mod
     from . import report_template
+    from . import approval
     from .catia_driver import FakeCatiaDriver, RealCatiaDriver
     from .abaqus_runner import FakeAbaqusRunner, RealAbaqusRunner
 except ImportError:
@@ -28,6 +29,7 @@ except ImportError:
     import template_registry
     import run_study as rs_mod
     import report_template
+    import approval
     from catia_driver import FakeCatiaDriver, RealCatiaDriver
     from abaqus_runner import FakeAbaqusRunner, RealAbaqusRunner
 
@@ -156,7 +158,34 @@ class WorkbenchService(object):
                 self._catia(study_id), self.conn, base.overlay(options))
         except Exception as exc:
             raise ServiceError(str(exc))
+
+        # 报告产出后登记审批（票18）：**新版本一律从 pending_review 开始**，
+        # 绝不继承上一版的审批结果。不改 run_study 签名，由服务层后置登记。
+        rep_id = (result.get("artifacts") or {}).get("report")
+        if rep_id:
+            st = self._register_report_approval(study_id, rep_id, result)
+            if st is not None:
+                result["approval"] = st
+                # 回填审计用：报告版本号便于 UI 显示"待审核 v2"
+                result["report"]["version"] = st["version"]
         return result
+
+    def _register_report_approval(self, study_id, report_artifact_id, result=None):
+        """把一版报告产物登记进审批流（新版本 -> pending_review）。"""
+        row = self.conn.execute(
+            "SELECT version FROM artifacts WHERE id=?",
+            (report_artifact_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            return approval.ensure_registered(
+                self.conn, study_id, report_artifact_id, int(row["version"]))
+        except approval.ApprovalError as exc:
+            # 审批登记失败不应吞掉报告本身：记进 warnings，服务层仍返回产物
+            if result is not None:
+                result.setdefault("warnings", []).append(
+                    "报告审批状态登记失败: %s" % exc)
+            return None
 
     # ---------------- 血缘 ----------------
 
@@ -272,3 +301,55 @@ class WorkbenchService(object):
         if not os.path.isfile(path):
             report_template.build_standard_template(path)
         return path
+
+    # ---------------- 报告审批流（票18） ----------------
+    #
+    # 服务层只做**薄封装**：真正的状态机与审计在 core/approval.py（纯 Python 可单测）。
+    # UI 调这里，测试也可以直接调 approval，两层都能用。
+
+    def get_approval(self, study_id, version=None):
+        """取报告审批状态快照（默认最新版）；未登记返回 None。"""
+        return approval.get_state(self.conn, study_id, version)
+
+    def list_approval_versions(self, study_id):
+        """该 Study 所有已登记审批的报告版本。"""
+        return approval.list_versions(self.conn, study_id)
+
+    def get_approval_history(self, study_id, version=None):
+        """审批审计历史（L2 decisions：角色/动作/理由/时间）。"""
+        return approval.history(self.conn, study_id, version)
+
+    def pending_approvals(self, role):
+        """按角色查询待处理清单（reviewer=待审 / signer=待签 / design,analysis=已退回）。"""
+        return approval.pending_for_role(self.conn, role)
+
+    def approve_report(self, study_id, opinion=None, version=None,
+                       role=None, operator=None):
+        """审核通过。失败抛 ServiceError（原因可读）。"""
+        return self._approval_call(
+            approval.approve, study_id, version,
+            role=role or approval.ROLE_REVIEWER, opinion=opinion,
+            operator=operator)
+
+    def reject_report(self, study_id, opinion=None, version=None,
+                      role=None, operator=None):
+        """审核退回（必须填意见）。失败抛 ServiceError（原因可读）。"""
+        return self._approval_call(
+            approval.reject, study_id, version,
+            role=role or approval.ROLE_REVIEWER, opinion=opinion,
+            operator=operator)
+
+    def sign_report(self, study_id, opinion=None, version=None,
+                    role=None, operator=None):
+        """签发（必须已通过审核）。失败抛 ServiceError（原因可读）。"""
+        return self._approval_call(
+            approval.sign, study_id, version,
+            role=role or approval.ROLE_SIGNER, opinion=opinion,
+            operator=operator)
+
+    def _approval_call(self, fn, study_id, version, **kwargs):
+        try:
+            return fn(self.conn, study_id, version, **kwargs)
+        except approval.ApprovalError as exc:
+            raise ServiceError(str(exc))
+
