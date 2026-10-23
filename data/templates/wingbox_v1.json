@@ -22,5 +22,11 @@
     "note": "翼面类布置：肋(等 y 线) × 长桁(等 xi 线)。P2 起拓扑生成按此声明分派（票11）。",
     "params": {"axial": "span", "n_frames": "n_ribs", "n_stringers": "n_stringers"}
   },
+  "checks": {
+    "note": "本部件族的默认校核口径（spec 用户故事 18：各族可指定不同默认准则与许用值）。调用方显式传入的 rules 优先级更高。",
+    "criteria": ["tsai_wu", "hashin"],
+    "allowables": {"Xt": 1500.0, "Xc": 1200.0, "Yt": 50.0, "Yc": 200.0, "S": 70.0},
+    "safety_factor": 1.5
+  },
   "template_file": "data/templates/wingbox_v1.CATPart"
 }

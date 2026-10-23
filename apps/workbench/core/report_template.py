@@ -13,8 +13,10 @@ import os
 
 try:
     from docx import Document
+    from docx.shared import Pt
 except ImportError:  # pragma: no cover
     Document = None
+    Pt = None
 
 
 # 全部占位符（模板生成器与渲染器共用，便于一致性测试）
@@ -52,15 +54,72 @@ PLACEHOLDERS = [
     "summary.n_detail_rows",
     "summary.n_bays_checked",
     "summary.n_bays_excluded",
+    # 分析类型（票14）
+    "analysis.kind",
+    "analysis.label",
+    "analysis.detail",
+    # 网格质量（票15 / spec 用户故事 35）
+    "mesh_quality.summary",
+    "mesh_quality.warnings",
+    "mesh_quality.n_warn_bays",
+    "mesh_quality.n_refined_bays",
+    "mesh_quality.worst_jacobian",
+    "mesh_quality.max_aspect",
+    "mesh_quality.max_warp",
+    "mesh_quality.criteria",
     # 结构化
     "param_table",
     "detail_table",
     "hotspot_table",
     "invalid_bay_table",
+    "mesh_quality_table",
     "artifact_table",
     "hotspot_figure",
     "conclusion",
 ]
+
+# 标准模板版本。**新增占位符时必须递增**，否则已经存在的
+# data/templates/report_standard.docx（旧版）不会被重建，
+# 新章节就永远不会出现在报告里（用户看到的是老模板）。
+TEMPLATE_VERSION = 2
+
+# 标记段落：写进 docx 正文，用于识别这份模板是哪一版
+VERSION_MARKER = "模板版本：v%d" % TEMPLATE_VERSION
+
+
+def template_needs_rebuild(path):
+    """
+    判断已有的标准模板是否该重建。
+
+    * 文件不存在 -> 需要建
+    * 文件里找不到当前版本标记 -> 是旧版，需要重建
+    * 版本标记匹配 -> 沿用（用户可能已把它替换成自有规范格式，
+      有正确标记就说明是基于当前版本改的，不该覆盖）
+    """
+    if not os.path.isfile(path):
+        return True
+    if Document is None:
+        return False
+    try:
+        doc = Document(path)
+    except Exception:
+        return True
+    for para in doc.paragraphs:
+        if VERSION_MARKER in (para.text or ""):
+            return False
+    return True
+
+
+def ensure_standard_template(path):
+    """
+    确保标准模板存在**且是当前版本**；返回实际可用的路径。
+
+    这是 run_study 应该调用的入口（而不是"文件不存在才建"）：
+    否则 P2 新增的网格质量/分析类型章节在已有安装上永远不生效。
+    """
+    if template_needs_rebuild(path):
+        build_standard_template(path)
+    return path
 
 
 def build_standard_template(path):
@@ -122,6 +181,13 @@ def build_standard_template(path):
     # 2 校核依据
     doc.add_heading("2  校核依据", level=1)
     p = doc.add_paragraph()
+    p.add_run("分析类型：").bold = True
+    p.add_run("{{analysis.label}}")
+    p.add_run("（").bold = True
+    p.add_run("{{analysis.kind}}")
+    p.add_run("）    说明：")
+    p.add_run("{{analysis.detail}}")
+    p = doc.add_paragraph()
     p.add_run("失效准则：").bold = True
     p.add_run("{{check.criteria}}")
     p = doc.add_paragraph()
@@ -169,6 +235,31 @@ def build_standard_template(path):
     doc.add_heading("5  危险部位图", level=1)
     doc.add_paragraph("{{hotspot_figure}}")
 
+    # 5.1 网格质量（票15 / spec 用户故事 35：审核人须知道结论的适用边界）
+    doc.add_heading("5.1  网格质量与结论适用边界", level=2)
+    p = doc.add_paragraph()
+    p.add_run("质量门结论：").bold = True
+    p.add_run("{{mesh_quality.summary}}")
+    p = doc.add_paragraph()
+    p.add_run("判定阈值：").bold = True
+    p.add_run("{{mesh_quality.criteria}}")
+    p = doc.add_paragraph()
+    p.add_run("未达标自然格数：").bold = True
+    p.add_run("{{mesh_quality.n_warn_bays}}")
+    p.add_run("    已自动加密格数：")
+    p.add_run("{{mesh_quality.n_refined_bays}}")
+    p = doc.add_paragraph()
+    p.add_run("最坏指标：畸变度 ").bold = True
+    p.add_run("{{mesh_quality.worst_jacobian}}")
+    p.add_run("，长宽比 ")
+    p.add_run("{{mesh_quality.max_aspect}}")
+    p.add_run("，翘曲度 ")
+    p.add_run("{{mesh_quality.max_warp}}")
+    p = doc.add_paragraph()
+    p.add_run("质量警告：").bold = True
+    p.add_run("{{mesh_quality.warnings}}")
+    doc.add_paragraph("{{mesh_quality_table}}")
+
     # 6 结论
     doc.add_heading("6  结论与建议", level=1)
     doc.add_paragraph("{{conclusion}}")
@@ -181,6 +272,14 @@ def build_standard_template(path):
     p = doc.add_paragraph()
     p.add_run("说明：本报告结论文字为 AI 辅助草稿（L1），须经人工审核签发（L2）；"
               "FI/MS 的计算与判定为确定性算法（L0），不含 AI 参与。").italic = True
+
+    # 版本标记（供 template_needs_rebuild 识别；新增占位符时必须递增 TEMPLATE_VERSION）
+    p = doc.add_paragraph()
+    run = p.add_run(VERSION_MARKER)
+    try:
+        run.font.size = Pt(7)
+    except Exception:
+        pass
 
     out_dir = os.path.dirname(os.path.abspath(path))
     if out_dir and not os.path.isdir(out_dir):

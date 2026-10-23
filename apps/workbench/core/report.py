@@ -33,7 +33,8 @@ PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
 _REPORT_OPTIONS = {}
 
 TABLE_PLACEHOLDERS = ("param_table", "detail_table", "hotspot_table",
-                      "invalid_bay_table", "artifact_table")
+                      "invalid_bay_table", "artifact_table",
+                      "mesh_quality_table")
 IMAGE_PLACEHOLDERS = ("hotspot_figure",)
 
 
@@ -55,6 +56,12 @@ def build_report_context(result, generated_at=None):
       {{summary.max_fi}} {{summary.all_pass}} ...
       结构化：{{param_table}} {{detail_table}} {{hotspot_table}}
              {{invalid_bay_table}} {{artifact_table}} {{hotspot_figure}}
+             {{mesh_quality_table}}（票15，P2 增补）
+
+    分析类型与网格质量（P2，票14/票15）：
+      {{analysis.kind}} {{analysis.label}} {{analysis.detail}}
+      {{mesh_quality.summary}} {{mesh_quality.warnings}}
+      {{mesh_quality.n_warn_bays}} {{mesh_quality.n_refined_bays}}
     """
     chk = result.get("check") or {}
     summ = chk.get("summary") or {}
@@ -67,6 +74,15 @@ def build_report_context(result, generated_at=None):
     allow_txt = ("Xt=%g, Xc=%g, Yt=%g, Yc=%g, S=%g MPa"
                  % (allow.get("Xt", 0), allow.get("Xc", 0),
                     allow.get("Yt", 0), allow.get("Yc", 0), allow.get("S", 0)))
+
+    # 分析类型（票14）：报告须写明本结论基于哪种分析，否则审核人无法判断适用边界
+    analysis_ctx, analysis_spec = _analysis_ctx(result)
+
+    # 网格质量（票15 / spec 用户故事 35）：
+    # 质量不达标的自然格**必须出现在报告里**，让审核人知道结论的适用边界。
+    # 这不是可选的装饰——"结论在哪些区域不可靠"是签发决策的输入。
+    mq_ctx, mq_rows, mq_text = _mesh_quality_ctx(
+        result.get("mesh_quality"), result)
 
     crit = summ.get("criteria") or []
     all_pass = summ.get("all_pass")
@@ -85,6 +101,12 @@ def build_report_context(result, generated_at=None):
     else:
         verdict = "本报告未包含有效校核结果。"
         advice = "请检查求解与抽取环节是否成功。"
+
+    # spec 用户故事 35：网格质量警告要改变结论的措辞，不能只躺在附录里
+    if (mq_ctx or {}).get("n_warn_bays"):
+        advice += ("\n注意：有 %d 个自然格的网格质量未达标（详见第 5.1 节），"
+                   "该区域的应力精度受限，结论在这些部位的适用性需人工确认。"
+                   % int(mq_ctx["n_warn_bays"]))
 
     conclusion = (verdict + "\n" + advice +
                   "\n（本结论为 AI 辅助草稿 L1，须经强度分析人员审核后签发 L2。）")
@@ -135,19 +157,161 @@ def build_report_context(result, generated_at=None):
             "rules_checksum": summ.get("rules_checksum", ""),
         },
 
+        # 分析类型（票14）：结论基于哪种分析，决定结论的适用边界
+        "analysis": analysis_ctx,
+
+        # 网格质量（票15 / spec 用户故事 35）
+        "mesh_quality": mq_ctx,
+
         # 结构化（表格/图片）
         "param_table": params,
         "detail_table": detail_rows,
         "hotspot_table": hotspots,
         "invalid_bay_table": invalid_bays,
+        "mesh_quality_table": mq_rows,
         "artifact_table": _artifact_rows(result),
         "hotspot_figure": result.get("hotspot_figure"),
         "conclusion": conclusion,
 
         # 兼容旧模板的顶层别名（{{allowables}} 等）
         "allowables": allow_txt,
+        "mesh_quality_summary": mq_text,
     }
     return ctx
+
+
+def _analysis_ctx(result):
+    """
+    分析类型上下文（票14）。
+
+    报告里必须写明"本结论基于哪种分析"，否则审核人无法判断结论适用边界
+    （例如显式动力学的结果不能按静力口径解读）。未启用分析类型扩展时
+    返回 P1 的静力口径，占位符照常有值。
+    """
+    try:
+        from . import analysis as analysis_mod
+    except ImportError:  # 允许 report.py 被当作脚本直接跑
+        try:
+            import analysis as analysis_mod
+        except ImportError:
+            analysis_mod = None
+
+    spec = result.get("analysis") or None
+    kind = (spec or {}).get("kind", "static")
+    if analysis_mod is not None:
+        label = analysis_mod.label(kind)
+        detail = analysis_mod.describe(spec)
+    else:  # pragma: no cover - analysis 模块始终存在，此处仅兜底
+        label = kind
+        detail = kind
+    ctx = {
+        "kind": kind,
+        "label": label,
+        "detail": detail,
+        "is_linear": ("是" if kind in ("static", "frequency", "buckle") else "否"),
+    }
+    if spec:
+        for k in ("time_period", "mass_scaling", "n_modes", "nonlinearity",
+                  "nlgeom"):
+            if k in spec:
+                ctx[k] = spec[k]
+    return ctx, spec
+
+
+def _mesh_quality_ctx(mq, result):
+    """
+    网格质量上下文（票15 / spec 用户故事 35）。
+
+    spec: "作为审核人员，我想在报告中看到网格质量警告（若有），
+           以便知道结论的适用边界。"
+
+    因此这里不只是把数字塞进附录：
+      * `warn_bays` 非空时，`summary` 与 `warnings` 都要有可读文字；
+      * 表格列出每个不达标自然格的指标与阈值，便于审核人定位。
+    未启用质量门时返回"未启用"的确定口径，占位符照常有值（不留空洞）。
+    """
+    mq = mq or {}
+    criteria = mq.get("criteria") or {}
+    warn_bays = mq.get("warn_bays") or []
+    refined = mq.get("refined_bays") or []
+    worst = mq.get("worst") or {}
+    # mesh_quality 里 warn_bays 是 id 列表；逐格明细在 bays 里（含 violations）。
+    # bays 记录可能用 'id' 或 'bay_id' 作为键，两者都收。
+    detail_by_id = {}
+    detail_list = []
+    for rec in (mq.get("bays") or []):
+        if not isinstance(rec, dict):
+            continue
+        detail_list.append(rec)
+        key = rec.get("bay_id") or rec.get("id")
+        if key:
+            detail_by_id[str(key)] = rec
+
+    if not mq or mq.get("enabled") is False:
+        empty = {
+            "enabled": False,
+            "summary": "未启用网格质量门（按 P1 默认网格策略）",
+            "warnings": "无",
+            "n_warn_bays": 0,
+            "n_refined_bays": 0,
+            "worst_jacobian": "—",
+            "max_aspect": "—",
+            "max_warp": "—",
+            "criteria": "",
+        }
+        return empty, [], empty["summary"]
+
+    n_warn = len(warn_bays)
+    if n_warn:
+        summary = ("网格质量门已启用：%d 个自然格未达标（已尝试自动加密 %d 个），"
+                   "该区域应力精度受限，结论适用性需人工确认"
+                   % (n_warn, len(refined)))
+    else:
+        summary = "网格质量门已启用：全部自然格达标"
+
+    warn_lines = mq.get("warnings") or []
+    warn_text = ("；".join(str(w) for w in warn_lines) if warn_lines else "无")
+
+    rows = []
+    for bid in warn_bays:
+        # bid 可能是 id 字符串，也可能（旧结构/手写测试）是 dict
+        if isinstance(bid, dict):
+            rec = bid
+            bid = rec.get("bay_id") or rec.get("id") or ""
+        else:
+            rec = detail_by_id.get(str(bid)) or {}
+        viol = rec.get("violations") or []
+        reasons = []
+        for v in viol:
+            if isinstance(v, dict):
+                reasons.append(str(v.get("metric") or v.get("reason") or ""))
+            else:
+                reasons.append(str(v))
+        rows.append({
+            "bay_id": str(bid),
+            "reason": "、".join([r for r in reasons if r]) or "未达标",
+            "jacobian": _fmt(rec.get("jacobian")),
+            "aspect_ratio": _fmt(rec.get("aspect_ratio")),
+            "warp": _fmt(rec.get("warp")),
+            "subdiv": rec.get("subdiv", ""),
+        })
+
+    ctx = {
+        "enabled": True,
+        "summary": summary,
+        "warnings": warn_text,
+        "n_warn_bays": n_warn,
+        "n_refined_bays": len(refined),
+        "worst_jacobian": _fmt(worst.get("jacobian")),
+        "max_aspect": _fmt(worst.get("aspect_ratio")),
+        "max_warp": _fmt(worst.get("warp")),
+        "criteria": (
+            "畸变度 ≥ %s，长宽比 ≤ %s，翘曲度 ≤ %s"
+            % (_fmt(criteria.get("jacobian_min", "—")),
+               _fmt(criteria.get("aspect_max", "—")),
+               _fmt(criteria.get("warp_max", "—")))),
+    }
+    return ctx, rows, summary
 
 
 def _artifact_rows(result):
@@ -367,6 +531,19 @@ def _insert_table_at(doc, para, key, data, warnings):
         for bid in (data or []):
             rows.append((str(bid), "不连续格：已排除出自然格级校核（ADR-0008），"
                                    "单元级校核照常"))
+    elif key == "mesh_quality_table":
+        # 网格质量报告（票15 / spec 用户故事 35）：
+        # 让审核人看到"哪些自然格的网格不可靠"，从而判断结论的适用边界。
+        rows = [("自然格", "未达标项", "畸变度", "长宽比", "翘曲度", "细分数")]
+        for r in (data or []):
+            rows.append((str(r.get("bay_id")),
+                         str(r.get("reason")),
+                         _fmt(r.get("jacobian")),
+                         _fmt(r.get("aspect_ratio")),
+                         _fmt(r.get("warp")),
+                         str(r.get("subdiv"))))
+        if len(rows) == 1:
+            rows.append(("（无）", "全部自然格达标", "—", "—", "—", "—"))
     else:
         return
 

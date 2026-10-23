@@ -91,6 +91,15 @@ def test_render(fails):
                     "n_bays_checked": 6, "n_bays_excluded": 0},
         "check": {"criteria": "tsai_wu", "safety_factor": "1.5",
                   "ms_threshold": "0", "allowables": "Xt=1500 MPa"},
+        # P2 新增命名空间（票14 分析类型 / 票15 网格质量）：
+        # 模板已声明这些占位符，手工构造的 ctx 也得给值，否则会被判"未解析"。
+        "analysis": {"kind": "static", "label": "静力分析",
+                     "detail": "静力分析（P1 默认）", "is_linear": "是"},
+        "mesh_quality": {"enabled": False,
+                         "summary": "未启用网格质量门（按 P1 默认网格策略）",
+                         "warnings": "无", "n_warn_bays": 0,
+                         "n_refined_bays": 0, "worst_jacobian": "—",
+                         "max_aspect": "—", "max_warp": "—", "criteria": ""},
         "allowables": "Xt=1500 MPa",
         "param_table": {"span": 5.0, "n_ribs": 3},
         "detail_table": [

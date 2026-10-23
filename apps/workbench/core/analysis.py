@@ -49,8 +49,14 @@ ANALYSIS_LABELS = {
 # 哪些类型是「线性」的（P1 只有这三种；perturbation/线性静力步）
 LINEAR_KINDS = ("static", "frequency", "buckle")
 
-# 允许的壳单元类型（铺层按 *SHELL SECTION 定义，故只能是壳族；ADR-0005）
-SHELL_ELEMENT_TYPES = ("S4R", "S4R5", "S8R", "S8R5")
+# 允许的壳单元类型（铺层按 *SHELL SECTION 定义，故只能是壳族；ADR-0005）。
+#
+# **只列网格生成器真的能产出的类型**：meshgen.add_quad 一律产出 4 节点四边形，
+# fe_build 也固定写 4 节点连接行。允许 S8R/S8R5（8 节点二次壳）会生成
+# `*ELEMENT, TYPE=S8R` + 4 节点记录 —— 那是 Abaqus 直接拒收的 .inp。
+# 声明了却写不出合法 .inp 的能力，比没有这个能力更糟（用户以为跑的是二次单元）。
+# 真要支持二次壳，得先让 meshgen 产出 8 节点单元，届时再往这里加。
+SHELL_ELEMENT_TYPES = ("S4R", "S4R5")
 
 # 壳单元的面标签：SPOS=正法向面，SNEG=负法向面（Abaqus 壳单元 5/6 号面）。
 # 接触对默认用这两个面——壳与壳的接触几乎总是这两个面，而不是边界面 1/2。

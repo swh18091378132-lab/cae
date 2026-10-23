@@ -23,5 +23,11 @@
     "note": "筒段类布置（票11 策略化的第二个模式）：框(等 y 线, y=轴向) × 桁条(等 xi 线, xi=周向 0..1)。自然格数 = (n_frames-1) × n_stringers；闭口接缝在 xi=1 处补一根桁条。physical.xi_scale 由 radius 推出 = 2πr（周向展开长度），故 FE 与网格质量门无需区分部件族。开口落在某格内部则判该格不连续（cutout）。",
     "params": {"axial": "length", "n_frames": "n_frames", "n_stringers": "n_stringers", "radius": "radius"}
   },
+  "checks": {
+    "note": "机身筒段的默认校核口径（spec 用户故事 18）。筒段以环向（hoop）应力为主，横向许用值取更高值、纵向略降；安全系数沿用型号级 1.5。调用方显式传入的 rules 优先级更高。",
+    "criteria": ["tsai_wu", "hashin"],
+    "allowables": {"Xt": 1400.0, "Xc": 1150.0, "Yt": 60.0, "Yc": 220.0, "S": 75.0},
+    "safety_factor": 1.5
+  },
   "template_file": "data/templates/fuselage_section_v1.CATPart"
 }

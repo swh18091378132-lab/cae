@@ -240,6 +240,86 @@ def _effective_step_name(fe, analysis_spec):
     return (fe.step or {}).get("name", "Step-1")
 
 
+def _next_report_version(study_id, conn):
+    """
+    该 Study 下一版报告的版本号（= 已有 report 产物数 + 1）。
+
+    报告文件名带版本号，是为了让每一版报告**各自落盘、互不覆盖**：
+    artifact 表本来就按 version 递增且不可变，文件系统必须跟上，
+    否则 v1 的 content_uri 指向的文件会被 v2 的内容改写。
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) AS v FROM artifacts "
+        "WHERE study_id=? AND kind='report'", (study_id,)).fetchone()
+    return int(row["v"]) + 1
+
+
+def _attach_model_config(study_id, template_id, params, model_id, conn, result):
+    """
+    把本次 Study 关联到型号配置（票16 / spec 关键契约）。
+
+    spec: "`run_study(...)` 增加：分析类型、网格质量策略、**型号配置引用（可选）**。"
+
+    型号配置下的部件是**分解出来的**（`model_config.create_model_config` 已按规则
+    生成 wing/tail/fuselage 等部件）。这里只负责把本次 Study 挂到 template_id 匹配
+    的那个部件上；匹配不到就显式报告，不硬塞一个凭空造的部件（那会污染型号结构）。
+
+    关联失败**不阻断分析**（型号配置是管理维度的信息，不该让一次算例白跑），
+    但必须在 result 里显式留痕，不静默吞掉。
+    """
+    try:
+        from . import model_config as mc_mod
+    except ImportError:
+        import model_config as mc_mod
+
+    try:
+        target_part = None
+        for p in (mc_mod.list_parts(conn, model_id) or []):
+            if p.get("template_id") == template_id:
+                target_part = p.get("part_key")
+                break
+        if target_part is None:
+            result["model_config"] = {
+                "model_id": model_id, "attached": False,
+                "error": "型号配置下没有使用模板 %r 的部件" % template_id}
+            result.setdefault("warnings", []).append(
+                "型号配置关联跳过：型号 %s 下无模板 %s 的部件"
+                % (model_id, template_id))
+            return
+        mc_mod.attach_study(conn, model_id, target_part, study_id)
+        result["model_config"] = {"model_id": model_id,
+                                  "part_key": target_part,
+                                  "attached": True}
+    except Exception as exc:
+        result["model_config"] = {"model_id": model_id, "attached": False,
+                                  "error": str(exc)}
+        result.setdefault("warnings", []).append(
+            "型号配置关联失败(model=%s): %s" % (model_id, exc))
+
+
+def _merge_rules(base, override):
+    """
+    深合并两层规则 dict（override 优先）。
+
+    用于"部件族默认口径 + 调用方覆盖"：模板声明的准则/许用值是各族特点，
+    但调用方显式给的值永远赢（否则用户改不了规则）。
+    任一侧为 None 时返回另一侧的副本。
+    """
+    if not base:
+        return override
+    if not override:
+        return base
+    out = {}
+    for k, v in base.items():
+        out[k] = dict(v) if isinstance(v, dict) else v
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge_rules(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def _mesh_quality_artifact_params(fe):
     """网格质量门（票15）要写进 mesh 产物 params 的字段；未启用则为空。"""
     q = getattr(fe, "mesh_quality", None) or {}
@@ -357,6 +437,13 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
         "catpart_checksum": catpart.checksum,
     }
 
+    # 3.5) 型号配置关联（票16 的 `model_config_id`，spec 关键契约要求 run_study 接受它）
+    # 在参数契约校验通过、参数集产物落盘之后做：到这一步该 Study 已经确定要跑，
+    # 于是把它挂到「全机 → 部件 → Study」层级里，供型号级汇总追溯。
+    if opts.model_config_id:
+        _attach_model_config(study_id, tpl.id, params, opts.model_config_id,
+                             conn, result)
+
     # 4) 结构拓扑模型 -> 自然格 + 不连续格（票 03；票 11 起按模板声明分派布置规则）
     if with_topology:
         model = topology.build_topology(
@@ -456,15 +543,22 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
 
         step_name_hint = _effective_step_name(fe, analysis_spec) \
             if analysis_spec else None
-        solve_kwargs = {}
-        if analysis_spec:
-            solve_kwargs["analysis"] = analysis_spec
         try:
-            sol = abaqus.solve(fe.inp_path, job_name, sdir,
-                               step_name=step_name_hint, **solve_kwargs)
-        except TypeError:
-            # 兼容只实现 P1 签名的第三方 runner（协议向后兼容）
-            sol = abaqus.solve(fe.inp_path, job_name, sdir, step_name=None)
+            if analysis_spec:
+                sol = abaqus.solve(fe.inp_path, job_name, sdir,
+                                   step_name=step_name_hint,
+                                   analysis=analysis_spec)
+            else:
+                sol = abaqus.solve(fe.inp_path, job_name, sdir,
+                                   step_name=step_name_hint)
+        except TypeError as exc:
+            # 不静默降级：降级会让"血缘记着 Explicit、实际跑的是静力"这种
+            # 不可追溯的错配发生（ADR-0007 可追溯性）。只在 runner 确实不支持
+            # analysis 参数时给出明确诊断。
+            raise StudyRunError(
+                "Abaqus runner 的 solve() 不接受分析类型参数，"
+                "无法执行 %s 分析: %s"
+                % ((analysis_spec or {}).get("kind", "static"), exc))
         except Exception as exc:
             raise StudyRunError("Abaqus 求解失败: %s" % exc)
         if sol.status != "COMPLETED":
@@ -517,7 +611,11 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             raise StudyRunError("强度校核需要先启用 with_solve")
 
         try:
-            rule_set = strength_check.load_rules(rules_path, rules)
+            # 部件族默认口径（spec 用户故事 18）：模板声明的准则/许用值作**最低优先级**
+            # 覆盖项，调用方传入的 rules / rules_path 仍然优先。
+            fam_rules = tpl.default_rules()
+            merged_rules = _merge_rules(fam_rules, rules) if fam_rules else rules
+            rule_set = strength_check.load_rules(rules_path, merged_rules)
         except Exception as exc:
             raise StudyRunError("校核规则无效: %s" % exc)
 
@@ -534,7 +632,10 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             study_id, "check_rule", content_uri=rules_uri,
             params={"criteria": rule_set["criteria"],
                     "safety_factor": rule_set["safety_factor"],
-                    "rules_checksum": strength_check.rules_checksum(rule_set)},
+                    "rules_checksum": strength_check.rules_checksum(rule_set),
+                    # 票18/P2：规则来自哪个部件族的默认口径，便于追溯"为什么用这套许用值"
+                    "family_defaults_used": bool(fam_rules),
+                    "template_id": tpl.id},
             conn=conn)
 
         # 单元 -> 自然格 归属（来自网格：单元按格划分，故可直接推）
@@ -591,8 +692,9 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
                 os.path.dirname(os.path.abspath(__file__)))))
             tpl_path = os.path.join(repo_root, "data", "templates",
                                     "report_standard.docx")
-            if not os.path.isfile(tpl_path):
-                report_template.build_standard_template(tpl_path)
+            # 用 ensure_ 而不是"不存在才建"：P2 给模板加过章节（网格质量/分析类型），
+            # 已有的旧版模板必须被重建，否则新章节永远不出现。
+            report_template.ensure_standard_template(tpl_path)
 
         # 危险部位图
         fig_path = os.path.join(rdir, "hotspot.png")
@@ -617,7 +719,16 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
 
         # 渲染
         ctx = report_mod.build_report_context(result)
-        out_path = report_out or os.path.join(rdir, "strength_report.docx")
+        # 报告文件必须**按版本落盘**：artifact 是不可变的（同一 Study 重跑产生新版本），
+        # 若两次都写同一个 strength_report.docx，v1 的文件内容会被 v2 覆盖 ——
+        # 而已签发的 v1 报告从此无法取回，"签发后不可再改"就成了空话。
+        # 因此除非调用方显式指定 report_out，一律带版本号。
+        if report_out:
+            out_path = report_out
+        else:
+            next_ver = _next_report_version(study_id, conn)
+            out_path = os.path.join(
+                rdir, "strength_report_v%d.docx" % next_ver)
         try:
             rr = report_mod.render_report(study_id, ctx, tpl_path, out_path,
                                           report_options=opts.report_options)

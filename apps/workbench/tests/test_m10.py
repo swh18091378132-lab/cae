@@ -326,6 +326,22 @@ def test_service_and_cli(conn, tmp, fails):
         fails.append("CLI `main.py run wingbox_v1` 失败(rc=%d)" % rc)
 
 
+def test_py38(fails):
+    """6) Python 3.8 兼容：本票引入/改动的模块不得用 3.9+ 语法。"""
+    import compat_py38
+    targets = [
+        os.path.join(CORE, "run_study.py"),
+        os.path.join(CORE, "workbench_service.py"),
+        os.path.join(CORE, "compat_py38.py"),
+        os.path.join(WORKBENCH, "main.py"),
+        os.path.join(HERE, "test_m10.py"),
+    ]
+    bad = compat_py38.check_paths(targets)
+    if bad:
+        fails.append("Python 3.8 兼容性检查未通过:\n%s"
+                     % compat_py38.format_violations(bad))
+
+
 def main():
     fails = []
     tmp = _fresh("m10")
@@ -342,6 +358,8 @@ def main():
     test_report_options_passthrough(conn, tmp, fails)
     print("5. 服务层与 CLI 适配 ...")
     test_service_and_cli(conn, tmp, fails)
+    print("6. Python 3.8 兼容 ...")
+    test_py38(fails)
 
     conn.close()
 

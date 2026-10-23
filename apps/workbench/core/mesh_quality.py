@@ -458,11 +458,7 @@ def evaluate(model, mesh, policy=None, surface=None):
     pol = normalize_policy(policy)
     if surface is None:
         surface = pol.get("surface")
-    criteria = {
-        "jacobian_min": pol["jacobian_min"],
-        "aspect_max": pol["aspect_max"],
-        "warp_max": pol["warp_max"],
-    }
+    criteria = criteria_of(pol)
 
     ext = _extents(model)
     table = _node_table(mesh)
@@ -733,11 +729,7 @@ def apply_gate(model, mesh, policy=None):
     `require_conforming=True`（默认）同样抛错。
     """
     pol = normalize_policy(policy)
-    criteria = {
-        "jacobian_min": pol["jacobian_min"],
-        "aspect_max": pol["aspect_max"],
-        "warp_max": pol["warp_max"],
-    }
+    criteria = criteria_of(pol)
     surface = pol.get("surface")
 
     if not pol["enabled"]:

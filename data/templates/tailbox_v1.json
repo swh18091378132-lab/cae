@@ -43,5 +43,11 @@
        "note": "升降舵操纵面切口：格内有开口，传力路径中断 -> 不连续格（ADR-0008）"}
     ]
   },
+  "checks": {
+    "note": "尾翼盒段的默认校核口径（spec 用户故事 18）。尾翼通常为更薄蒙皮、更高剪应力占比，故剪切许用值取更保守值；安全系数沿用型号级 1.5。调用方显式传入的 rules 优先级更高。",
+    "criteria": ["tsai_wu", "hashin", "max_stress"],
+    "allowables": {"Xt": 1350.0, "Xc": 1100.0, "Yt": 45.0, "Yc": 180.0, "S": 62.0},
+    "safety_factor": 1.5
+  },
   "template_file": "data/templates/tailbox_v1.CATPart"
 }

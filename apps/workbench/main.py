@@ -86,8 +86,9 @@ def cmd_lineage(sid):
     print_lineage(sid)
 
 
-def cmd_run(template_id, mode="fake", analysis=None, mesh_quality=None):
-    """一条命令跑完整个 P1 链（票 08）；P2 起可追加分析类型与网格策略（票10/14/15）。"""
+def cmd_run(template_id, mode="fake", analysis=None, mesh_quality=None,
+            quality_gate=False, model_config_id=None):
+    """一条命令跑完整个 P1 链（票 08）；P2 起可追加分析类型与网格策略（票10/14/15/16）。"""
     from workbench_service import WorkbenchService
     from run_study import RunOptions
 
@@ -108,6 +109,12 @@ def cmd_run(template_id, mode="fake", analysis=None, mesh_quality=None):
             opts.analysis = analysis
         if mesh_quality:
             opts.mesh_quality = mesh_quality
+        elif quality_gate:
+            # spec: "网格生成后自动评估质量指标" / "可关闭自动加密（仅出质量报告）"
+            # 默认策略启用评估与自动加密；--no-auto-refine 可只出报告。
+            opts.mesh_quality = {"enabled": True, "auto_refine": True}
+        if model_config_id:
+            opts.model_config_id = model_config_id
 
         res = svc.run_chain(sid, params, template_id, options=opts)
         print()
@@ -116,6 +123,14 @@ def cmd_run(template_id, mode="fake", analysis=None, mesh_quality=None):
         print()
         print("校核汇总: %s" % json.dumps(chk.get("summary") or {},
                                         ensure_ascii=False, sort_keys=True))
+        mq = res.get("mesh_quality") or {}
+        if mq:
+            print()
+            print("网格质量: 未达标 %d 格 / 已加密 %d 格"
+                  % (len(mq.get("warn_bays") or []),
+                     len(mq.get("refined_bays") or [])))
+            for w in (mq.get("warnings") or [])[:5]:
+                print("  [q] %s" % w)
         rep = res.get("report") or {}
         print("报告: %s" % rep.get("path"))
         if rep.get("warnings"):
@@ -149,7 +164,21 @@ if __name__ == "__main__":
             i = args.index("--analysis")
             if len(args) > i + 1:
                 analysis = args[i + 1]
-        sys.exit(cmd_run(tpl, mode, analysis=analysis))
+        # --quality-gate：启用网格质量门（评估 + 自动加密；票15）
+        quality_gate = "--quality-gate" in args or "--no-auto-refine" in args
+        mesh_quality = None
+        if "--no-auto-refine" in args:
+            # 只出质量报告，不自动加密（票15"可关闭自动加密"）
+            mesh_quality = {"enabled": True, "auto_refine": False}
+        # --model <型号配置 id>：把本次 Study 挂到型号层级（票16）
+        model_config_id = None
+        if "--model" in args:
+            i = args.index("--model")
+            if len(args) > i + 1:
+                model_config_id = args[i + 1]
+        sys.exit(cmd_run(tpl, mode, analysis=analysis,
+                         mesh_quality=mesh_quality, quality_gate=quality_gate,
+                         model_config_id=model_config_id))
     elif args[0] == "ui":
         mode = "real" if "--real" in args else "fake"
         sys.exit(cmd_ui(mode))

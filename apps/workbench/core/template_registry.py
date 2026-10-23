@@ -27,6 +27,10 @@ class Template(object):
         self.parameters = data.get("parameters", [])
         self.envelope = data.get("envelope", {})
         self.template_file = data.get("template_file", "")
+        # 部件族默认校核口径（P2 / spec 用户故事 18）：
+        # "为不同部件族指定不同的默认准则与许用值，以便贴合各族材料与结构特点"
+        # 形状与 strength_check.load_rules 的 overrides 一致，但优先级最低。
+        self.checks = data.get("checks", {}) or {}
         self._base_dir = base_dir
 
     def names(self):
@@ -34,6 +38,21 @@ class Template(object):
 
     def contract(self):
         return {p["name"]: p for p in self.parameters}
+
+    def default_rules(self):
+        """
+        该部件族的默认校核规则覆盖项（可空 dict）。
+
+        只包含模板**显式声明**的部分（准则、许用值、安全系数等），
+        其余由 strength_check.DEFAULT_RULES 兜底。调用方传入的 rules 优先级更高。
+        """
+        out = {}
+        for key in ("criteria", "allowables", "safety_factor", "ms_threshold",
+                    "stress_source"):
+            if key in self.checks:
+                val = self.checks[key]
+                out[key] = dict(val) if isinstance(val, dict) else val
+        return out
 
     def full_path(self):
         if not self.template_file:

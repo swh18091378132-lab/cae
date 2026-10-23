@@ -438,17 +438,23 @@ def reset_for_new_version(conn, study_id, artifact_id, version,
                            operator=operator, rationale=rationale)
 
 
-def ensure_registered(conn, study_id, artifact_id, version, role=ROLE_ANALYSIS):
+def ensure_registered(conn, study_id, artifact_id, version, role=ROLE_ANALYSIS,
+                      status=STATUS_PENDING_REVIEW):
     """
-    幂等登记：已有该版本则原样返回，否则登记为「待审核」。
+    幂等登记：已有该版本则原样返回，否则按 `status` 登记（默认「待审核」）。
 
     给服务层用——同一版本重复调用不会把已有审批状态冲掉（同一版本 = 同一内容），
     而**新版本**（重跑）一定走 ``register_report`` 的 pending_review 重置路径。
+
+    `status=STATUS_ANALYZING` 用于"分析已开始、报告尚未产出"的登记：
+    这样 spec 用户故事 26（"看到每个 Study 当前处于流程的哪个环节"）里的
+    「分析中」是**真的会出现**的状态，而不是一个永远到不了的状态。
     """
     row = _fetch(conn, study_id, version)
     if row is not None:
         return _state_dict(conn, row)
-    return register_report(conn, study_id, artifact_id, version, role=role)
+    return register_report(conn, study_id, artifact_id, version, role=role,
+                           status=status)
 
 
 # ---------------------------------------------------------------------------

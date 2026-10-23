@@ -157,34 +157,102 @@ class WorkbenchService(object):
             with_report=with_report,
             report_dir=self._dir(study_id, "report"))
 
+        # 运行开始前先把该 Study 标成「分析中」（票18 状态机起点 / spec 用户故事 26）。
+        # 这样项目负责人在型号汇总里看到的是"分析中"，而不是"未提交审批"
+        # ——后者会让人以为这份报告已经跑完且在等人处理。
+        analysing_version = self._begin_analysis(study_id)
+
         try:
             result = rs_mod.run_study(
                 study_id, parameter_set, template_id,
                 self._catia(study_id), self.conn, base.overlay(options))
         except Exception as exc:
+            # 运行失败：把「分析中」标记撤掉，避免留下一个永远停在分析中的幽灵版本
+            self._abort_analysis(study_id, analysing_version, str(exc))
             raise ServiceError(str(exc))
 
         # 报告产出后登记审批（票18）：**新版本一律从 pending_review 开始**，
         # 绝不继承上一版的审批结果。不改 run_study 签名，由服务层后置登记。
         rep_id = (result.get("artifacts") or {}).get("report")
         if rep_id:
-            st = self._register_report_approval(study_id, rep_id, result)
+            st = self._register_report_approval(study_id, rep_id, result,
+                                               analysing_version)
             if st is not None:
                 result["approval"] = st
                 # 回填审计用：报告版本号便于 UI 显示"待审核 v2"
                 result["report"]["version"] = st["version"]
+        else:
+            # 没出报告（with_report=False）：分析已完成，撤掉「分析中」
+            self._abort_analysis(study_id, analysing_version,
+                                 "本次运行未生成报告（with_report=False）")
         return result
 
-    def _register_report_approval(self, study_id, report_artifact_id, result=None):
+    def _begin_analysis(self, study_id):
+        """
+        登记"分析中"；返回占位版本号（报告尚未产出，故用下一版版本号）。
+
+        返回 None 表示登记失败（不影响主流程，审批是管理维度信息）。
+        """
+        try:
+            next_ver = self._next_report_version(study_id)
+            row = self.conn.execute(
+                "SELECT id FROM artifacts WHERE study_id=? AND kind='report' "
+                "ORDER BY version DESC LIMIT 1", (study_id,)).fetchone()
+            artifact_id = row["id"] if row is not None else None
+            approval.ensure_registered(self.conn, study_id, artifact_id,
+                                       next_ver, status=approval.STATUS_ANALYZING)
+            return next_ver
+        except Exception:
+            return None
+
+    def _abort_analysis(self, study_id, version, reason):
+        """
+        运行失败时删除「分析中」占位记录。
+
+        必须真的删掉而不是改成别的状态：一个停在"分析中"的版本会让汇总视图
+        长期显示错误的进度，而它对应的报告从来不存在。
+        """
+        if version is None:
+            return
+        try:
+            self.conn.execute(
+                "DELETE FROM report_approvals WHERE study_id=? AND version=? "
+                "AND status=?", (study_id, version,
+                                 approval.STATUS_ANALYZING))
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def _next_report_version(self, study_id):
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM artifacts "
+            "WHERE study_id=? AND kind='report'", (study_id,)).fetchone()
+        v = int(row["v"]) + 1
+        # 「分析中」占位已经用过该版本号时让位（同一 Study 连续两次运行）
+        row2 = self.conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM report_approvals "
+            "WHERE study_id=?", (study_id,)).fetchone()
+        return max(v, int(row2["v"]) + 1)
+
+    def _register_report_approval(self, study_id, report_artifact_id, result=None,
+                                  analysing_version=None):
         """把一版报告产物登记进审批流（新版本 -> pending_review）。"""
         row = self.conn.execute(
             "SELECT version FROM artifacts WHERE id=?",
             (report_artifact_id,)).fetchone()
         if row is None:
             return None
+        version = int(row["version"])
         try:
+            # 「分析中」占位若与真实报告版本同号，先删占位再登记真实状态，
+            # 否则 ensure_registered 会幂等返回占位行，报告永远停在"分析中"。
+            self.conn.execute(
+                "DELETE FROM report_approvals WHERE study_id=? AND version=? "
+                "AND status=?", (study_id, version,
+                                 approval.STATUS_ANALYZING))
+            self.conn.commit()
             return approval.ensure_registered(
-                self.conn, study_id, report_artifact_id, int(row["version"]))
+                self.conn, study_id, report_artifact_id, version)
         except approval.ApprovalError as exc:
             # 审批登记失败不应吞掉报告本身：记进 warnings，服务层仍返回产物
             if result is not None:
@@ -300,12 +368,10 @@ class WorkbenchService(object):
         return p
 
     def ensure_report_template(self, path=None):
-        """确保标准报告模板存在；返回路径。"""
+        """确保标准报告模板存在**且是当前版本**；返回路径。"""
         if path is None:
             path = os.path.join(self.work_root, "report_standard.docx")
-        if not os.path.isfile(path):
-            report_template.build_standard_template(path)
-        return path
+        return report_template.ensure_standard_template(path)
 
     # ---------------- 报告审批流（票18） ----------------
     #
