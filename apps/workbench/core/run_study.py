@@ -6,7 +6,8 @@ run_study.py -- Study 编排器（唯一主测试切口）
   M1(票02)：参数集 -> 参数契约/包络校验 -> CATIA 再生数模 -> 血缘
   M2(票03)：数模 -> 结构拓扑模型 -> 自然格 + 不连续格 -> 血缘
   M3(票04)：拓扑 -> 网格(与自然格对齐) -> 铺层(CAE 属性)+载荷/BC -> .inp -> 血缘
-后续票 05-07 将在此继续接入 求解/抽取/校核/报告，接口保持向后兼容。
+  M4(票05)：.inp -> Abaqus 求解(.odb) -> ODB 抽取(CSV/JSON+manifest) -> 血缘
+后续票 06-07 将在此继续接入 校核/报告，接口保持向后兼容。
 
 兼容 Python 3.8。
 """
@@ -34,7 +35,8 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
               holes=None, stringer_runout=None, partial_ribs=None,
               with_topology=True, with_fe_model=False, fe_dir=None,
               subdiv_per_bay=4, plies=None, material=None,
-              step=None, load=None):
+              step=None, load=None,
+              abaqus=None, with_solve=False, job_name="job1", solve_dir=None):
     """
     执行一次 Study。返回 dict 汇总。
 
@@ -159,5 +161,57 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             "inp_path": fe.inp_path,
         }
         result["fe_model"] = fe
+
+    # 6) Abaqus 求解 + 结果抽取（票 05）
+    if with_solve:
+        if not with_fe_model:
+            raise StudyRunError("求解需要先启用 with_fe_model")
+        if abaqus is None:
+            raise StudyRunError("求解需要提供 abaqus runner（Real/Fake）")
+
+        sdir = solve_dir or (os.path.join(params_dir, "solve") if params_dir else "solve")
+        if not os.path.isdir(sdir):
+            os.makedirs(sdir)
+
+        try:
+            sol = abaqus.solve(fe.inp_path, job_name, sdir, step_name=None)
+        except Exception as exc:
+            raise StudyRunError("Abaqus 求解失败: %s" % exc)
+        if sol.status != "COMPLETED":
+            raise StudyRunError("Abaqus 求解未完成(status=%s)\n%s"
+                                % (sol.status, sol.log_tail))
+
+        odb_id = add_artifact(
+            study_id, "odb", content_uri=sol.odb_path,
+            params={"job": job_name, "status": sol.status},
+            conn=conn)
+        link(result["artifacts"]["inp"], odb_id, conn=conn)
+
+        try:
+            ext = abaqus.extract(sol.odb_path, sdir)
+        except Exception as exc:
+            raise StudyRunError("结果抽取失败: %s" % exc)
+
+        ext_id = add_artifact(
+            study_id, "extraction", content_uri=ext.csv_path,
+            params={"n_rows": ext.manifest.get("n_rows"),
+                    "n_section_points": ext.manifest.get("n_section_points"),
+                    "section_points": ext.manifest.get("section_points"),
+                    "position": ext.manifest.get("position"),
+                    "source_odb_sha256": ext.manifest.get("source_odb_sha256"),
+                    "abaqus_version": ext.manifest.get("abaqus_version"),
+                    "python_version": ext.manifest.get("python_version")},
+            conn=conn)
+        link(odb_id, ext_id, conn=conn)
+
+        result["artifacts"]["odb"] = odb_id
+        result["artifacts"]["extraction"] = ext_id
+        result["solve"] = {"job": job_name, "status": sol.status,
+                           "odb_path": sol.odb_path}
+        result["extraction"] = {
+            "csv_path": ext.csv_path,
+            "manifest_path": ext.manifest_path,
+            "manifest": ext.manifest,
+        }
 
     return result

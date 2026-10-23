@@ -1,23 +1,24 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
-compat_check.py -- Abaqus 6.13 (Python 2.6.2) 兼容性静态检查
+compat_check.py -- Abaqus 内置 Python 兼容性静态检查
 
-ADR-0003：Abaqus 6.13 内置 Python 是 2.6.2，不是 2.7/3.x。
-2.6.2 下会**直接语法/运行失败**的写法必须被拦下。
+**基线：Abaqus 2023 内置 Python 2.7.15（ADR-0012 实测；取代原 ADR-0003 的 2.6.2 假设）。**
 
-本模块是**纯标准库**，可在宿主 Python (3.8) 上运行，用于检查
+2.7 已支持的（**不再拦截**）：dict/set 推导、str.format、print() 函数式、
+with 多上下文、OrderedDict、collections、argparse 等。
+
+仍然拦截（2.7 也没有，属于 3.x-only）：
+  1. f-string                         (3.6+)
+  2. `yield from`                     (3.3+)
+  3. `nonlocal`                        (3.0+)
+  4. 变量注解 / 参数注解 / 函数返回注解 (3.0+)
+  5. `async` / `await`                 (3.5+)
+  6. 解包扩展 `[*a, *b]` / `{**a}`     (3.5+)
+  7. 数字字面量下划线 `1_000`          (3.6+)
+  8. 海象运算符 `:=`                   (3.8+)
+
+本模块是**纯标准库**，可在宿主 Python (3.8+) 上运行，用于检查
 abaqus_capabilities/ 下将在 Abaqus 内部执行的脚本。
-
-检查项（保守但高价值）：
-  1. 语法层面：用 py2 风格大括号 print 检测（2.6 无 print() 函数，但 print(...) 单值可用，
-     故只禁 f-string 与 dict/set 推导等 2.7+ 特性）
-  2. f-string                      -> 2.6 语法错误
-  3. 带关键字的 dict 推导/集合推导  -> 2.6 不支持
-  4. `yield from`                  -> 2.6 不支持
-  5. `nonlocal`                    -> 2.6 不支持
-  6. `{}` 形式的 set 字面量在 2.6 可用，不检查
-  7. `str.format` 的自动编号 `{}` 在 2.6 可用，不检查
-  8. `import` 现代库（numpy 高版本 API 等）无法静态判断，此处仅标注
 
 用法:
     python abaqus_capabilities/compat_check.py [路径...]
@@ -54,48 +55,76 @@ class Py262Checker(ast.NodeVisitor):
         self.violations.append(
             Violation(self.path, getattr(node, "lineno", 0), rule, detail))
 
-    # --- f-string (JoinedStr / FormattedValue) ---
+    # --- f-string (JoinedStr) : 3.6+ ---
     def visit_JoinedStr(self, node):
-        self._add(node, "f-string", "Python 2.6.2 不支持 f-string，用 % 或 .format()")
+        self._add(node, "f-string", "Python 2.7 不支持 f-string，用 % 或 .format()")
         self.generic_visit(node)
 
-    # --- yield from ---
+    # --- yield from : 3.3+ ---
     def visit_YieldFrom(self, node):
-        self._add(node, "yield-from", "Python 2.6.2 不支持 yield from")
+        self._add(node, "yield-from", "Python 2.7 不支持 yield from")
         self.generic_visit(node)
 
-    # --- nonlocal ---
+    # --- nonlocal : 3.0+ ---
     def visit_Nonlocal(self, node):
-        self._add(node, "nonlocal", "Python 2.6.2 不支持 nonlocal")
+        self._add(node, "nonlocal", "Python 2.7 不支持 nonlocal")
         self.generic_visit(node)
 
-    # --- 推导式中带 if 的异步/复杂形式不做；重点拦 dict/set 推导 ---
-    def visit_DictComp(self, node):
-        self._add(node, "dict-comprehension", "Python 2.6.2 不支持 dict 推导，用 dict((k,v) for ...)")
-        self.generic_visit(node)
-
-    def visit_SetComp(self, node):
-        self._add(node, "set-comprehension", "Python 2.6.2 不支持集合推导，用 set(... for ...)")
-        self.generic_visit(node)
-
-    # --- 带注解的函数/变量 (3.x only) ---
+    # --- 变量注解 : 3.0+ ---
     def visit_AnnAssign(self, node):
-        self._add(node, "annotation", "Python 2.6.2 不支持变量注解")
+        self._add(node, "annotation", "Python 2.7 不支持变量注解")
         self.generic_visit(node)
 
+    # --- 参数/函数返回注解 : 3.0+ ---
     def visit_arguments(self, node):
         for a in list(getattr(node, "args", [])):
             if getattr(a, "annotation", None) is not None:
-                self._add(a, "annotation", "Python 2.6.2 不支持参数注解")
+                self._add(a, "annotation", "Python 2.7 不支持参数注解")
         self.generic_visit(node)
 
-    # --- print 函数形式：2.6 可用 print('x')（单值括号）; 但 print(a, b) 会当 tuple 打印
-    #     这里不强制，只在多参数时提示（需人工判断）
-    def visit_Call(self, node):
-        f = node.func
-        if isinstance(f, ast.Name) and f.id == "print" and len(node.args) > 1:
-            self._add(node, "print-multiarg",
-                      "2.6 的 print(a, b) 会打印 tuple，建议用 %% 拼接")
+    def visit_FunctionDef(self, node):
+        if getattr(node, "returns", None) is not None:
+            self._add(node, "annotation", "Python 2.7 不支持函数返回注解")
+        self.generic_visit(node)
+
+    # --- async / await : 3.5+ ---
+    def visit_AsyncFunctionDef(self, node):
+        self._add(node, "async", "Python 2.7 不支持 async 函数")
+        self.generic_visit(node)
+
+    def visit_Await(self, node):
+        self._add(node, "async", "Python 2.7 不支持 await")
+        self.generic_visit(node)
+
+    # --- 解包扩展 [*a] / {**a} : 3.5+ ---
+    def visit_List(self, node):
+        for elt in node.elts:
+            if isinstance(elt, ast.Starred):
+                self._add(node, "unpack-generalization",
+                          "Python 2.7 不支持列表解包 [*a]")
+                break
+        self.generic_visit(node)
+
+    def visit_Dict(self, node):
+        for k in node.keys:
+            if k is None:  # {**a} 在 AST 中 key 为 None
+                self._add(node, "unpack-generalization",
+                          "Python 2.7 不支持字典解包 {**a}")
+                break
+        self.generic_visit(node)
+
+    # --- 数字字面量下划线 1_000 : 3.6+ ---
+    def visit_Constant(self, node):
+        seg = getattr(node, "end_col_offset", None)
+        if isinstance(getattr(node, "value", None), (int, float)) and not isinstance(
+                getattr(node, "value", None), bool):
+            try:
+                raw = ast.get_source_segment(self.source, node) or ""
+            except Exception:
+                raw = ""
+            if "_" in raw:
+                self._add(node, "numeric-underscore",
+                          "Python 2.7 不支持数字下划线 1_000")
         self.generic_visit(node)
 
 
@@ -136,13 +165,13 @@ def main(argv):
             all_v.extend(check_file(p))
 
     if all_v:
-        print("Python 2.6.2 COMPAT: %d violation(s) in %d file(s)"
+        print("Python 2.7(2.6.2-subset) COMPAT: %d violation(s) in %d file(s)"
               % (len(all_v), n_files))
         for v in all_v:
             print("  " + str(v))
         return 1
 
-    print("Python 2.6.2 COMPAT: OK (%d file(s) checked)" % n_files)
+    print("Python 2.7(2.6.2-subset) COMPAT: OK (%d file(s) checked)" % n_files)
     return 0
 
 
