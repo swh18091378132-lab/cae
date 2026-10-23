@@ -154,9 +154,9 @@ def write_inp(path, mesh_dict, model_dict, laminate, material, step,
     ltype = load.get("type", "pressure")
     mag = float(load.get("magnitude", 0.0))
     if ltype == "pressure":
-        # 面压作用在壳单元上（S4R: P4 为面压）
+        # 面压：S4R 壳单元用 P（P4 是实体单元面压，对 S4R 非法）
         add("*DLOAD")
-        add("ALL, P4, %s" % _fmt(mag))
+        add("ALL, P, %s" % _fmt(mag))
     elif ltype == "tip_force":
         # 尖部（y = span）节点施加展向?  这里施加载荷方向的集中力
         tip_nodes = [n["id"] for n in mesh_dict["nodes"]
