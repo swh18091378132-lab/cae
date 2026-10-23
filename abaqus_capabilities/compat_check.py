@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 compat_check.py -- Abaqus 内置 Python 兼容性静态检查
 
