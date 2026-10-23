@@ -20,12 +20,18 @@ try:
     from . import topology
     from . import fe_model
     from . import strength_check
+    from . import report as report_mod
+    from . import hotspot_figure
+    from . import report_template
     from .study import add_artifact, link
 except ImportError:
     import template_registry
     import topology
     import fe_model
     import strength_check
+    import report as report_mod
+    import hotspot_figure
+    import report_template
     from study import add_artifact, link
 
 
@@ -40,7 +46,9 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
               subdiv_per_bay=4, plies=None, material=None,
               step=None, load=None,
               abaqus=None, with_solve=False, job_name="job1", solve_dir=None,
-              with_check=False, rules=None, rules_path=None, check_dir=None):
+              with_check=False, rules=None, rules_path=None, check_dir=None,
+              with_report=False, report_dir=None, report_template_path=None,
+              report_out=None):
     """
     执行一次 Study。返回 dict 汇总。
 
@@ -278,6 +286,62 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             "summary": chk["summary"],
             "hotspots": chk["hotspots"],
             "invalid_bays": chk["invalid_bays"],
+        }
+
+    # 8) 强度校核报告（票 07）
+    if with_report:
+        if not with_check:
+            raise StudyRunError("生成报告需要先启用 with_check")
+
+        rdir = report_dir or (os.path.join(params_dir, "report") if params_dir else "report")
+        if not os.path.isdir(rdir):
+            os.makedirs(rdir)
+
+        # 模板：未指定则用标准模板（不存在则生成）
+        tpl_path = report_template_path
+        if not tpl_path:
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))))
+            tpl_path = os.path.join(repo_root, "data", "templates",
+                                    "report_standard.docx")
+            if not os.path.isfile(tpl_path):
+                report_template.build_standard_template(tpl_path)
+
+        # 危险部位图
+        fig_path = os.path.join(rdir, "hotspot.png")
+        fig_warnings = []
+        try:
+            hotspot_figure.draw_hotspot_figure(result, fig_path)
+            result["hotspot_figure"] = fig_path
+        except Exception as exc:
+            fig_warnings.append("危险部位图生成失败: %s" % exc)
+            result["hotspot_figure"] = None
+
+        # 渲染
+        ctx = report_mod.build_report_context(result)
+        out_path = report_out or os.path.join(rdir, "strength_report.docx")
+        try:
+            rr = report_mod.render_report(ctx, tpl_path, out_path)
+        except Exception as exc:
+            raise StudyRunError("报告渲染失败: %s" % exc)
+
+        warnings = list(fig_warnings) + list(rr.get("warnings") or [])
+        rep_id = add_artifact(
+            study_id, "report", content_uri=out_path,
+            params={"template": os.path.basename(tpl_path),
+                    "n_hotspots": len(result["check"]["hotspots"]),
+                    "n_unresolved": len(rr.get("unresolved") or []),
+                    "warnings": warnings},
+            conn=conn)
+        link(result["artifacts"]["check_result"], rep_id, conn=conn)
+
+        result["artifacts"]["report"] = rep_id
+        result["report"] = {
+            "path": out_path,
+            "figure": result.get("hotspot_figure"),
+            "template": tpl_path,
+            "warnings": warnings,
+            "unresolved": rr.get("unresolved") or [],
         }
 
     return result
