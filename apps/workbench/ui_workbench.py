@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-ui_workbench.py -- 本地工程工作台 UI（票 08）
+ui_workbench.py -- 本地工程工作台 UI（票 08 / 票 19）
 
 Tkinter 最小实现（Win7 无浏览器依赖）。**只调用 workbench_service**，
 自身不含编排逻辑，便于把可测逻辑留在服务层。
 
-布局：
-  左：模板选择 + 参数输入 + 运行按钮
-  右上：运行日志
-  右下：血缘树 + 报告按钮
+布局（票19 起分两个标签页，原有布局与功能保持不变）：
+  「分析」页
+    左：模板选择 + 参数输入 + 运行按钮 + 已有分析任务
+    右上：运行日志
+    右下：血缘树 + 报告按钮
+  「审批与型号汇总」页（票19 新增）
+    上：角色切换（审核 / 签发 / 设计 / 强度分析）+ 刷新
+    左：待办列表（按角色区分：待审 / 待签 / 已退回）+ 型号汇总视图
+    右：审核详情（血缘 + 校核明细 + 审批历史）+ 通过 / 退回 / 签发
+    签发按钮**只对已通过审核的报告可用**（不满足时置灰并在提示里说明原因）。
 
 兼容 Python 3.8。
 """
@@ -29,6 +35,16 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from workbench_service import WorkbenchService, ServiceError
+import workbench_service as _ws
+
+
+# 审批页的角色下拉项：（角色键, 显示名）
+ROLE_CHOICES = (
+    ("reviewer", "审核（待审清单）"),
+    ("signer", "签发（待签清单）"),
+    ("design", "设计（已退回）"),
+    ("analysis", "强度分析（已退回）"),
+)
 
 
 class WorkbenchApp(object):
@@ -39,8 +55,14 @@ class WorkbenchApp(object):
         self._queue = []
         self._running = False
 
-        root.title("CAE 结构设计分析工作台 — P1")
-        root.geometry("1100x720")
+        # 审批页状态（票19）
+        self.role_var = None
+        self._inbox_rows = []
+        self._review_detail = None
+        self._model_ids = []
+
+        root.title("CAE 结构设计分析工作台 — P2")
+        root.geometry("1180x760")
 
         self._build_ui()
         self._poll_queue()
@@ -48,7 +70,26 @@ class WorkbenchApp(object):
     # ---------------- UI 构建 ----------------
 
     def _build_ui(self):
-        main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        """顶层 Notebook：保留原「分析」页，新增「审批与型号汇总」页。"""
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.analysis_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.analysis_tab, text="分析")
+        self._build_analysis_tab(self.analysis_tab)
+
+        self.approval_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.approval_tab, text="审批与型号汇总")
+        self._build_approval_tab(self.approval_tab)
+
+        self._load_templates()
+        self._refresh_studies()
+        self._refresh_models()
+        self.on_refresh_inbox()
+        self.on_refresh_rollup()
+
+    def _build_analysis_tab(self, parent):
+        main = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         # 左：参数区
@@ -117,8 +158,295 @@ class WorkbenchApp(object):
         self.lineage = tk.Text(lin_frame, height=14, wrap="none")
         self.lineage.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        self._load_templates()
-        self._refresh_studies()
+    # ---------------- 审批与型号汇总页（票19） ----------------
+
+    def _build_approval_tab(self, parent):
+        """审批工作台：角色切换 + 待办列表 + 审核详情 + 通过/退回/签发 + 型号汇总。"""
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X, padx=6, pady=(6, 2))
+        ttk.Label(top, text="当前角色").pack(side=tk.LEFT)
+        self.role_var = tk.StringVar(value=ROLE_CHOICES[0][1])
+        self.role_combo = ttk.Combobox(
+            top, textvariable=self.role_var, state="readonly", width=24,
+            values=[c[1] for c in ROLE_CHOICES])
+        self.role_combo.pack(side=tk.LEFT, padx=6)
+        self.role_combo.bind("<<ComboboxSelected>>",
+                             lambda e: self.on_role_change())
+        ttk.Button(top, text="刷新待办", command=self.on_refresh_inbox).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(top, text="刷新型号汇总",
+                   command=self.on_refresh_rollup).pack(side=tk.LEFT)
+
+        body = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        # 左：待办 + 型号汇总
+        left = ttk.PanedWindow(body, orient=tk.VERTICAL)
+        body.add(left, weight=1)
+
+        inbox_frame = ttk.LabelFrame(left, text="待办（按角色区分）")
+        left.add(inbox_frame, weight=1)
+        self.inbox = tk.Listbox(inbox_frame, height=10)
+        self.inbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.inbox.bind("<<ListboxSelect>>", lambda e: self.on_inbox_select())
+
+        rollup_frame = ttk.LabelFrame(left, text="型号汇总：各部件报告流程状态")
+        left.add(rollup_frame, weight=1)
+        rrow = ttk.Frame(rollup_frame)
+        rrow.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Label(rrow, text="型号配置").pack(side=tk.LEFT)
+        self.model_var = tk.StringVar()
+        self.model_combo = ttk.Combobox(rrow, textvariable=self.model_var,
+                                       state="readonly", width=34)
+        self.model_combo.pack(side=tk.LEFT, padx=6)
+        self.model_combo.bind("<<ComboboxSelected>>",
+                              lambda e: self.on_refresh_rollup())
+        self.rollup_text = tk.Text(rollup_frame, height=10, wrap="none")
+        self.rollup_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # 右：审核详情 + 动作
+        right = ttk.LabelFrame(body, text="审核详情（血缘 + 校核明细 + 审批历史）")
+        body.add(right, weight=2)
+
+        act = ttk.Frame(right)
+        act.pack(fill=tk.X, padx=4, pady=(4, 0))
+        self.btn_approve = ttk.Button(act, text="审核通过…",
+                                      command=self.on_approve)
+        self.btn_approve.pack(side=tk.LEFT)
+        self.btn_reject = ttk.Button(act, text="审核退回…",
+                                     command=self.on_reject)
+        self.btn_reject.pack(side=tk.LEFT, padx=6)
+        self.btn_sign = ttk.Button(act, text="签发", command=self.on_sign)
+        self.btn_sign.pack(side=tk.LEFT, padx=(18, 0))
+        self.btn_open_rep = ttk.Button(act, text="打开报告",
+                                       command=self.on_open_review_report)
+        self.btn_open_rep.pack(side=tk.LEFT, padx=6)
+
+        self.detail = tk.Text(right, height=26, wrap="none")
+        self.detail.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._update_action_buttons()
+
+    # ---------------- 审批页数据加载（票19） ----------------
+
+    def _role_key(self):
+        """下拉框显示名 -> 角色键（reviewer / signer / design / analysis）。"""
+        text = self.role_var.get() if self.role_var is not None else ""
+        for key, name in ROLE_CHOICES:
+            if name == text:
+                return key
+        return ROLE_CHOICES[0][0]
+
+    def on_role_change(self):
+        self.on_refresh_inbox()
+
+    def on_refresh_inbox(self):
+        """刷新当前角色的待办清单（所有数据来自服务层，UI 不做判断）。"""
+        role = self._role_key()
+        self.inbox.delete(0, tk.END)
+        self._inbox_rows = []
+        try:
+            rows = self.svc.approval_inbox(role)
+        except Exception as exc:
+            self._log("加载待办失败: %s" % exc)
+            rows = []
+        for row in rows:
+            self._inbox_rows.append(row)
+            self.inbox.insert(tk.END, row.get("label") or row.get("study_id"))
+        if rows:
+            self.inbox.selection_set(0)
+            self.on_inbox_select()
+        else:
+            self._review_detail = None
+            self.detail.delete("1.0", tk.END)
+            self.detail.insert(tk.END, "当前角色（%s）没有待处理事项。"
+                               % _ws.approval.role_name(role))
+            self._update_action_buttons()
+
+    def on_inbox_select(self):
+        sel = self.inbox.curselection()
+        if not sel or sel[0] >= len(self._inbox_rows):
+            return
+        row = self._inbox_rows[sel[0]]
+        try:
+            # 传 role：服务层只回该角色**可见**的动作（UI 不复制角色权限表）
+            detail = self.svc.get_review_detail(row["study_id"],
+                                                row["version"],
+                                                role=self._role_key())
+        except ServiceError as exc:
+            self._review_detail = None
+            self.detail.delete("1.0", tk.END)
+            self.detail.insert(tk.END, str(exc))
+            self._update_action_buttons()
+            return
+        self._review_detail = detail
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert(tk.END, detail.get("text") or "")
+        self.current_study = row["study_id"]
+        self._update_action_buttons()
+
+    def _update_action_buttons(self):
+        """
+        按"报告状态 + 当前角色"决定按钮可用性。
+
+        关键验收：签发按钮**只对已通过审核的报告可用**；
+        未通过审核时置灰（服务层 can_sign_report 给出可读原因，这里只消费）。
+        """
+        detail = self._review_detail
+        actions = (detail or {}).get("actions") or []
+        self.btn_approve.config(
+            state=(tk.NORMAL if _ws.APPROVAL_ACTION_APPROVE in actions
+                   else tk.DISABLED))
+        self.btn_reject.config(
+            state=(tk.NORMAL if _ws.APPROVAL_ACTION_REJECT in actions
+                   else tk.DISABLED))
+        can_sign = bool((detail or {}).get("can_sign")) and \
+            _ws.APPROVAL_ACTION_SIGN in actions
+        self.btn_sign.config(state=(tk.NORMAL if can_sign else tk.DISABLED))
+
+    # ---------------- 审批动作（票19） ----------------
+
+    def _ask_text(self, title, prompt, initial=""):
+        """简易多行意见输入框（退回必须填意见，所以不用 simpledialog）。"""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        ttk.Label(win, text=prompt).pack(anchor="w", padx=8, pady=(8, 2))
+        txt = tk.Text(win, height=5, width=60)
+        txt.insert("1.0", initial)
+        txt.pack(padx=8, pady=4)
+        result = {"text": None}
+
+        def _ok():
+            result["text"] = txt.get("1.0", tk.END).strip()
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        row = ttk.Frame(win)
+        row.pack(pady=(0, 8))
+        ttk.Button(row, text="确定", command=_ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="取消", command=_cancel).pack(side=tk.LEFT)
+        try:
+            self.root.wait_window(win)
+        except Exception:
+            pass
+        return result["text"]
+
+    def on_approve(self):
+        if not self._review_detail:
+            return
+        d = self._review_detail
+        opinion = self._ask_text("审核通过", "审核意见（可选）：")
+        if opinion is None:
+            return
+        try:
+            self.svc.approve_report(d["study_id"], opinion=opinion or "同意",
+                                    version=d["version"])
+        except ServiceError as exc:
+            messagebox.showerror("审核失败", str(exc))
+            return
+        self._log("审核通过：%s 报告 v%s" % (d["study_id"], d["version"]))
+        self.on_refresh_inbox()
+        self.on_refresh_rollup()
+
+    def on_reject(self):
+        if not self._review_detail:
+            return
+        d = self._review_detail
+        opinion = self._ask_text("审核退回", "退回意见（必填，说明问题与修改要求）：")
+        if opinion is None:
+            return
+        if not opinion:
+            messagebox.showwarning("提示", "退回必须填写意见")
+            return
+        try:
+            self.svc.reject_report(d["study_id"], opinion=opinion,
+                                   version=d["version"])
+        except ServiceError as exc:
+            messagebox.showerror("退回失败", str(exc))
+            return
+        self._log("审核退回：%s 报告 v%s" % (d["study_id"], d["version"]))
+        self.on_refresh_inbox()
+        self.on_refresh_rollup()
+
+    def on_sign(self):
+        """签发：UI 只是消费服务层的判定结果（未通过审核时按钮本就置灰）。"""
+        if not self._review_detail:
+            return
+        d = self._review_detail
+        try:
+            self.svc.assert_can_sign(d["study_id"], d["version"])
+        except ServiceError as exc:
+            messagebox.showwarning("不能签发", str(exc))
+            return
+        opinion = self._ask_text("签发", "签发意见（可选）：")
+        if opinion is None:
+            return
+        try:
+            self.svc.sign_report(d["study_id"], opinion=opinion or None,
+                                 version=d["version"])
+        except ServiceError as exc:
+            messagebox.showerror("签发失败", str(exc))
+            return
+        self._log("已签发：%s 报告 v%s（最终版）"
+                  % (d["study_id"], d["version"]))
+        self.on_refresh_inbox()
+        self.on_refresh_rollup()
+
+    def on_open_review_report(self):
+        if not self._review_detail:
+            return
+        p = self._review_detail.get("report_path")
+        if not p:
+            messagebox.showinfo("提示", "该报告没有可打开的文件")
+            return
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(p)  # noqa
+        except Exception as exc:
+            messagebox.showerror("打开失败", str(exc))
+
+    # ---------------- 型号汇总视图（票19） ----------------
+
+    def _refresh_models(self):
+        """型号配置下拉框（供汇总视图选择）。"""
+        try:
+            models = self.svc.list_models()
+        except Exception as exc:
+            self._log("加载型号配置失败: %s" % exc)
+            models = []
+        self._model_ids = list(models)
+        labels = ["%s  %s" % (m.get("model_id"), m.get("name") or "")
+                  for m in models]
+        self.model_combo["values"] = labels
+        if labels:
+            self.model_combo.current(0)
+        else:
+            self.model_var.set("")
+
+    def _selected_model_id(self):
+        idx = self.model_combo.current()
+        if idx < 0 or idx >= len(self._model_ids):
+            return None
+        return self._model_ids[idx].get("model_id")
+
+    def on_refresh_rollup(self):
+        """刷新型号汇总视图：各部件报告处于哪个流程环节。"""
+        self.rollup_text.delete("1.0", tk.END)
+        if not self._model_ids:          # 型号配置是别的入口建的：这里顺带重载一次
+            self._refresh_models()
+        mid = self._selected_model_id()
+        if not mid:
+            self.rollup_text.insert(tk.END, "（尚无型号配置）")
+            return
+        try:
+            overview = self.svc.get_model_approval_overview(mid)
+        except ServiceError as exc:
+            self.rollup_text.insert(tk.END, "加载型号汇总失败: %s" % exc)
+            return
+        self.rollup_text.insert(tk.END, overview.get("text") or "")
+
 
     # ---------------- 数据加载 ----------------
 
@@ -258,6 +586,12 @@ class WorkbenchApp(object):
                 self.run_btn.config(state=tk.NORMAL)
                 self._refresh_studies()
                 self.on_refresh_lineage()
+                # 新报告产出即登记为待审核（票18），审批页随即能看到它（票19）
+                try:
+                    self.on_refresh_inbox()
+                    self.on_refresh_rollup()
+                except Exception as exc:
+                    self._log("审批页刷新失败: %s" % exc)
             elif kind == "error":
                 self._log("[错误] %s" % payload)
                 messagebox.showerror("运行失败", payload)
