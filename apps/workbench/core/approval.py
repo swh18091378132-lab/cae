@@ -32,6 +32,7 @@ approval.py -- 强度校核报告的多角色审批流（票18）
 """
 
 import datetime
+import re
 
 try:
     from . import study as study_mod
@@ -701,8 +702,11 @@ def record_optimize_decision(conn, study_id, decision, role=ROLE_SIGNER,
     if point_id is not None:
         parts.append("设计点 #%s" % point_id)
     text = rationale or decision_name(decision)
+    tag = _state_tag(session_id, point_id)
     if parts:
-        text = "（%s）%s" % ("，".join(parts), text)
+        text = "（%s）%s%s" % ("，".join(parts), tag, text)
+    elif tag:
+        text = "%s%s" % (tag, text)
 
     study_mod.add_decision(study_id, GATE_OPTIMIZE_DECISION,
                            _actor_text(role, operator), decision, text,
@@ -718,6 +722,34 @@ def record_optimize_decision(conn, study_id, decision, role=ROLE_SIGNER,
         "point_id": point_id,
         "rationale": text,
     }
+
+
+# 决策理由里的结构化标记：`[会话=OPT-2026-1][点=7]`
+#
+# 为什么不用子串匹配：`session_id in rationale` 会把 `OPT-2026-1` 匹配到
+# `OPT-2026-10` 里（前缀关系），两个会话的审计互相串台。用带分隔符的标记做
+# 精确提取，既有结构化语义，又不必给 decisions 表加列（P1 既有表不改结构）。
+_TAG_SESSION_RE = re.compile(r"\[会话=([^\]]+)\]")
+_TAG_POINT_RE = re.compile(r"\[点=([^\]]+)\]")
+
+
+def _state_tag(session_id, point_id):
+    parts = ""
+    if session_id:
+        parts += "[会话=%s]" % session_id
+    if point_id is not None:
+        parts += "[点=%s]" % point_id
+    return parts
+
+
+def _parse_state_tag(rationale):
+    """从理由文本里精确提取 (session_id, point_id)；缺失返回 (None, None)。"""
+    text = rationale or ""
+    m = _TAG_SESSION_RE.search(text)
+    sid = m.group(1) if m else None
+    m2 = _TAG_POINT_RE.search(text)
+    pid = m2.group(1) if m2 else None
+    return sid, pid
 
 
 def optimize_decisions(conn, study_id=None, session_id=None):
@@ -737,13 +769,16 @@ def optimize_decisions(conn, study_id=None, session_id=None):
     rows = conn.execute(sql, tuple(args)).fetchall()
     out = []
     for r in rows:
-        if session_id is not None:
-            if session_id not in (r["rationale"] or ""):
-                continue
+        sid, pid = _parse_state_tag(r["rationale"])
+        if session_id is not None and sid != session_id:
+            # 精确比对结构化标记，**不是**子串匹配 —— 否则 OPT-2026-1 会把
+            # OPT-2026-10 的记录一并捞出来（前缀关系导致串台）
+            continue
         out.append({"study_id": r["study_id"], "gate": r["gate"],
                     "actor": r["actor"], "decision": r["decision"],
                     "decision_name": decision_name(r["decision"]),
                     "rationale": r["rationale"],
+                    "session_id": sid, "point_id": pid,
                     "created_at": r["created_at"]})
     return out
 

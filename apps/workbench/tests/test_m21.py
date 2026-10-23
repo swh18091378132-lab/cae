@@ -409,10 +409,10 @@ def test_three_way_classification(fails):
     """三类结果在数据结构上可区分：ok / error / feasible 的组合各不相同。"""
     # (a) 跑通 + 满足约束
     good = objectives.evaluate(check_summary=_summary(),
-                                mass_kg=3.84)
+                                mass_kg=3.84, mass_components=["skin"])
     # (b) 跑通 + 违反约束
     bad = objectives.evaluate(check_summary=_summary(
-        all_pass=False, min_ms=-0.29, max_fi=1.4), mass_kg=3.84)
+        all_pass=False, min_ms=-0.29, max_fi=1.4), mass_kg=3.84, mass_components=["skin"])
     # (c) 技术故障
     broken = objectives.evaluate(error=RuntimeError("Abaqus 求解未完成"))
 
@@ -545,7 +545,7 @@ def test_evaluate_detects_mesh_violation(fails):
         "check": {"summary": _summary(all_pass=False, min_ms=-0.5, max_fi=2.0)},
         "mesh_quality": {"n_cross_bay_elems": 0, "n_hanging_nodes": 0},
     }
-    ev2 = objectives.evaluate(result=result2, mass_kg=3.84)
+    ev2 = objectives.evaluate(result=result2, mass_kg=3.84, mass_components=["skin"])
     if not (ev2["ok"] is True and ev2["feasible"] is False):
         fails.append("网格合格但强度不合格应为 ok=True/feasible=False，实际 %r"
                      % {k: ev2.get(k) for k in ("ok", "feasible")})
@@ -702,9 +702,9 @@ def test_offline_pure(fails):
         fails.append("纯内存评估的目标值不符: %r" % (ev["objective"]["value"],))
 
     # 便捷查询的口径要能直接驱动"挑最优"
-    feasible = objectives.evaluate(check_summary=_summary(), mass_kg=10.0)
+    feasible = objectives.evaluate(check_summary=_summary(), mass_kg=10.0, mass_components=["skin"])
     infeasible = objectives.evaluate(
-        check_summary=_summary(all_pass=False, min_ms=-0.1), mass_kg=1.0)
+        check_summary=_summary(all_pass=False, min_ms=-0.1), mass_kg=1.0, mass_components=["skin"])
     broken = objectives.evaluate(error=RuntimeError("boom"))
 
     if not objectives.is_feasible(feasible):
@@ -736,7 +736,9 @@ def test_offline_pure(fails):
     if "技术故障" not in objectives.summarize(broken):
         fails.append("summarize 未标明技术故障: %r" % objectives.summarize(broken))
 
-    # 调用方直接给数值时，不得替他编造"只含蒙皮"这种口径
+    # 调用方直接给数值时，不得替他编造"只含蒙皮"这种口径；
+    # 而且这个数**不得参与最优比较** —— 否则"少算了加筋所以最轻"的点会当选，
+    # 那不是更好的设计，是作弊的度量（spec：不允许只给一个数不说包含什么）。
     bare = objectives.evaluate(check_summary=_summary(), mass_kg=3.84)
     if bare["objective"]["components"]:
         fails.append("直接给数值时不应凭空声明 components，实际 %r"
@@ -744,7 +746,12 @@ def test_offline_pure(fails):
     if bare["objective"]["declared"] is not False:
         fails.append("直接给数值时应标 declared=False，实际 %r"
                      % (bare["objective"]["declared"],))
-    # 走 mass() 才有口径声明
+    if bare.get("comparable") is not False:
+        fails.append("未声明口径的质量应标 comparable=False，实际 %r"
+                     % (bare.get("comparable"),))
+    if bare.get("undeclared_reason") is None:
+        fails.append("未声明口径时应给出可读原因")
+    # 关键：即便它数值更小，排序也必须排在所有有口径的点之后
     declared = objectives.evaluate(
         check_summary=_summary(),
         mass_result=objectives.mass(_wing(), HAND_LAMINATE, density=DENSITY))
@@ -753,6 +760,14 @@ def test_offline_pure(fails):
     if declared["objective"]["components"] != ["skin"]:
         fails.append("走 mass() 时应带 components=['skin']，实际 %r"
                      % (declared["objective"]["components"],))
+    if declared.get("comparable") is not True:
+        fails.append("走 mass() 的点应是可比的")
+    # 用一个更小的裸数值对比：不可比点不得因此胜出
+    bare_small = objectives.evaluate(check_summary=_summary(), mass_kg=0.001)
+    if objectives.sort_key(bare_small) <= objectives.sort_key(declared):
+        fails.append("未声明口径的点（数值更小）不应排在声明口径的点之前："
+                     "%r vs %r" % (objectives.sort_key(bare_small),
+                                   objectives.sort_key(declared)))
 
 
 def test_py38(fails):

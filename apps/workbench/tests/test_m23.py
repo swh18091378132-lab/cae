@@ -84,11 +84,15 @@ def _summary(all_pass=True, max_fi=None, min_ms=None):
 
 
 def _feasible(mass):
-    return objectives.evaluate(check_summary=_summary(True), mass_kg=mass)
+    # 显式声明口径：真实调用方走 objectives.mass() 拿到的结果就自带 components。
+    # 未声明口径的数不可比（见 objectives.evaluate 的 comparable），不该用于搜索测试。
+    return objectives.evaluate(check_summary=_summary(True), mass_kg=mass,
+                               mass_components=["skin"])
 
 
 def _infeasible(mass):
-    return objectives.evaluate(check_summary=_summary(False), mass_kg=mass)
+    return objectives.evaluate(check_summary=_summary(False), mass_kg=mass,
+                               mass_components=["skin"])
 
 
 def _broken(message="求解失败"):
@@ -321,9 +325,14 @@ def test_failed_point_never_chosen(fails):
         fails.append("全部点都技术故障时仍给出了 best，实际 %r" % (res2["best"],))
     if res2["feasible"]:
         fails.append("全部点都故障时 feasible 应为 False")
-    if res2["stop_reason"] != optimizer.STOP_NO_FEASIBLE:
-        fails.append("全部点都故障时停止原因应为 no_feasible，实际 %r"
+    # 全部技术故障 ≠ 没有可行设计：前者要查环境（求解/网格/参数），后者要改设计。
+    # 报成 no_feasible 会把人引向错误方向（spec 用户故事 20）。
+    if res2["stop_reason"] != optimizer.STOP_ALL_FAILED:
+        fails.append("全部点都技术故障时停止原因应为 all_failed，实际 %r"
                      % (res2["stop_reason"],))
+    if "环境" not in (res2["stop_text"] or ""):
+        fails.append("all_failed 的可读原因应提示排查环境，实际 %r"
+                     % (res2["stop_text"],))
 
 
 def test_no_feasible_reported(fails):

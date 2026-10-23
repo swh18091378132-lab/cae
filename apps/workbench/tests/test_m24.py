@@ -719,7 +719,10 @@ def test_interop_with_optimizer(fails):
                 "n_bays_excluded": 0, "n_elems": 6, "n_detail_rows": 24,
                 "n_fail_rows": 0 if feasible else 3,
                 "criteria": ["tsai_wu"], "safety_factor": 1.5}
-        return objectives.evaluate(check_summary=summ, mass_kg=mass)
+        # 显式声明质量口径：真实调用方走 objectives.mass() 就自带 components，
+        # 未声明口径的数不可比（见 objectives.evaluate 的 comparable）。
+        return objectives.evaluate(check_summary=summ, mass_kg=mass,
+                                   mass_components=["skin"])
 
     result = optimizer.optimize(vars_, evaluate,
                                 budget={"max_evals": 50, "max_rounds": 10},

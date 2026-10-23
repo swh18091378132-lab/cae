@@ -391,6 +391,7 @@ class ErrorKind(object):
     MESH_VIOLATION = "mesh_violation"    # 网格破戒（ADR-0010）/ 界面悬挂节点
     NO_CHECK = "no_check"                # 没有校核结果（没跑到那一步）
     NO_MASS = "no_mass"                  # 算不出质量（缺层合板/尺度信息）
+    UNDECLARED_MASS = "undeclared_mass"  # 有数值但未声明口径（不知道含哪些部件）
     RUN_FAILED = "run_failed"            # 求解/抽取/建模失败
     UNKNOWN = "unknown"                  # 兜底：绝不能丢
 
@@ -520,7 +521,7 @@ def _mass_from_result(result, density=None, stiffeners=None):
 
 def evaluate(result=None, check_summary=None, mass_result=None, mass_kg=None,
              error=None, study_id=None, design=None, extra=None,
-             density=None, stiffeners=None):
+             density=None, stiffeners=None, mass_components=None):
     """
     把一次运行归一成统一的**评估结果**（优化器的唯一输入形态）。
 
@@ -599,6 +600,16 @@ def evaluate(result=None, check_summary=None, mass_result=None, mass_kg=None,
     mass_info = mass_result
     if mass_info is None and mass_kg is not None:
         mass_info = float(mass_kg)
+        # 调用方直接给数时，可以**显式声明**这数包含什么。不声明就不参与最优比较
+        # （见下方 comparable），但声明了就等价于走 mass() 拿到的口径。
+        if mass_components:
+            mass_info = {
+                "value": float(mass_kg), "unit": "kg",
+                "components": [str(c) for c in mass_components],
+                "basis": "caller_declared",
+                "breakdown": {}, "excluded": [],
+                "density": None, "declared_by": "caller",
+            }
     if mass_info is None and isinstance(result, dict):
         if result.get("mass"):
             mass_info = result.get("mass")
@@ -624,9 +635,24 @@ def evaluate(result=None, check_summary=None, mass_result=None, mass_kg=None,
             study_id=study_id, design=design, template=template,
             extra=extra, constraints_info=cons)
 
+    # 未声明口径的质量**不得参与"最优"竞争**。
+    #
+    # spec：「不允许只给一个数不说包含什么」。若一个"不知道含哪些部件"的数值
+    # 正常参与比较，它很可能因为"少算了加筋"而看起来最轻，于是当选最优 ——
+    # 那不是发现了更好的设计，那是作弊的度量。
+    #
+    # 做法是**保留可评估性、但把它挡在"最优"之外**（而不是判成技术故障）：
+    # 判成故障会让"我只想快速试算一下"的调用方寸步难行，也谎称了"没跑通"。
+    # 所以 ok=True / feasible 照常、值照常记下，只是不可比（comparable=False），
+    # sort_key 把它排到所有有口径的点之后。
+    undeclared = not objective.get("declared")
+
     return {
         "ok": True,
         "feasible": cons["feasible"],
+        "comparable": not undeclared,
+        "undeclared_reason": ("质量未声明口径（components 为空），"
+                              "不参与最优比较" if undeclared else None),
         "error": None,
         "objective": objective,
         "constraints": cons,
@@ -648,7 +674,7 @@ def _failure(payload, study_id=None, design=None, template=None, extra=None,
         "error": payload,
         "objective": {"name": "mass", "direction": OBJECTIVE_DIRECTION,
                       "value": None, "unit": None, "components": [],
-                      "basis": None},
+                      "declared": False, "basis": None},
         "constraints": constraints_info,
         "mass": None,
         "study_id": study_id,
@@ -678,11 +704,19 @@ def sort_key(ev):
 
     返回 (group, value)：group=0 可行、1 跑通但不可行、2 技术故障。
     故障点的 value 用 +inf，绝不会被选成"最优"。
+
+    **质量未声明口径的点也排到组 2**：它有数值、也跑通了，但"不知道含哪些部件"
+    的数与有口径的数不可比 —— 让它参与最优选择等于奖励少算的度量
+    （spec：不允许只给一个数不说包含什么）。它仍在 groups.failed 里可见，
+    不会静默消失。
     """
     if not ev or ev.get("ok") is False:
         return (2, float("inf"))
     value = (ev.get("objective") or {}).get("value")
     if value is None:
+        return (2, float("inf"))
+    if ev.get("comparable") is False:
+        # 未声明口径：不可比，不进"最优"
         return (2, float("inf"))
     if ev.get("feasible") is True:
         return (0, float(value))

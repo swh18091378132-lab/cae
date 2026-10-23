@@ -79,16 +79,19 @@ DEFAULT_BUDGET = {
 STOP_MAX_EVALS = "max_evals"          # 评估次数用尽
 STOP_MAX_ROUNDS = "max_rounds"        # 轮数用尽
 STOP_CONVERGED = "converged"          # 改进量低于阈值
-STOP_NO_FEASIBLE = "no_feasible"      # 一个可行点都没找到
+STOP_NO_FEASIBLE = "no_feasible"      # 跑通了，但没有一个满足约束的设计
+STOP_ALL_FAILED = "all_failed"        # 全部评估都技术故障（算不出来，不是设计不好）
 
 STOP_REASONS = (STOP_MAX_EVALS, STOP_MAX_ROUNDS, STOP_CONVERGED,
-                STOP_NO_FEASIBLE)
+                STOP_NO_FEASIBLE, STOP_ALL_FAILED)
 
 STOP_REASON_TEXT = {
     STOP_MAX_EVALS: "评估次数达到上限",
     STOP_MAX_ROUNDS: "迭代轮数达到上限",
     STOP_CONVERGED: "目标改进量低于阈值，已收敛",
     STOP_NO_FEASIBLE: "未找到任何满足约束的可行设计",
+    STOP_ALL_FAILED: ("全部设计点评估失败（求解/网格/参数等技术故障），"
+                      "不是设计不达标；请先排查运行环境"),
 }
 
 #: 设计点的分组（与 objectives.sort_key 的 group 一一对应）
@@ -756,8 +759,16 @@ def optimize(variables, evaluate, budget=None, seed=0, history=None,
     best_rec = _pick_best(known)
     feasible_points = [r for r in known if r["group"] == GROUP_FEASIBLE]
     if not feasible_points:
-        # 一个可行点都没找到：明确报告，绝不给一个含义不明的"最优"
-        stop_reason = STOP_NO_FEASIBLE
+        # 一个可行点都没找到：明确报告，绝不给一个含义不明的"最优"。
+        # 但**必须区分"设计都不达标"与"算都算不出来"** —— 两者对工程师的
+        # 含义完全不同：前者要改设计，后者要查环境（求解器/网格/参数）。
+        # 全都技术故障时报 no_feasible 会把人引向错误方向（spec 用户故事 20）。
+        grouped = _grouped(known)
+        n_failed = len(grouped.get("failed") or [])
+        if known and n_failed == len(known):
+            stop_reason = STOP_ALL_FAILED
+        else:
+            stop_reason = STOP_NO_FEASIBLE
         best_rec = None
 
     return {

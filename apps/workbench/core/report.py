@@ -266,7 +266,7 @@ def _adv_ctx(result, advisor=None):
             "degraded": "是" if (note_h.degraded or note_s.degraded) else "否",
         })
         if len(hotspots) <= 3:
-            advises.append(note_s.draft_text)
+            advises.append((note_s.draft_text, note_s.degraded))
 
     degraded = bool(note_check.degraded) or any(
         r["degraded"] == "是" for r in adv_rows)
@@ -277,9 +277,11 @@ def _adv_ctx(result, advisor=None):
         # 别处（邮件、摘要、评审意见），标注仍跟着它——这是 ADR-0002 要求的
         # "AI 输出必须可识别"，也避免审核人误把它当成确定性结论。
         "summary": _label_l1(note_check),
-        "suggest": ("\n\n".join(_label_l1_text(t) for t in advises) if advises
+        "suggest": ("\n\n".join(_label_l1_text(t, degraded=d) for t, d in advises)
+                    if advises
                     else "（危险部位过多，逐条建议见第 6.1.2 节 AI 辅助表）"),
-        "why": "\n\n".join(_label_l1_text(r["why"]) for r in adv_rows),
+        "why": "\n\n".join(_label_l1_text(r["why"], degraded=r["degraded"] == "是")
+                           for r in adv_rows),
         # 来源与状态（必须显式呈现给审核人）：
         #   degraded 是**布尔**（程序判断用），degraded_text 是中文（报告显示用）
         "advisor_id": note_check.advisor_id,
@@ -295,19 +297,35 @@ def _adv_ctx(result, advisor=None):
     return adv_ctx, adv_rows
 
 
-def _label_l1_text(text):
-    """给一段 AI 文字加上 L1 标注前缀（幂等：已带标注则不重复加）。"""
+def _label_l1_text(text, degraded=False):
+    """
+    给一段 L1 文字加上**如实的**来源标注（幂等：已带标注则不重复加）。
+
+    这是 ADR-0002「可解释、可回退、留痕」的落地点，也可能是最容易写错的地方：
+    **降级文本是确定性兜底，不是 AI 生成的**。若一律套上「AI 生成」前缀，
+    就把确定性内容错标成 AI 产物 —— 审核人据此会以为"这是机器编的、要打折看"，
+    而实际它恰恰是没被 AI 碰过的那份。方向反了的归因比没有标注更糟。
+
+    因此：
+      * 真 AI 输出 -> `L1_TEXT_PREFIX`（「L1 辅助草稿｜AI 生成，人可否决」）
+      * 降级兜底   -> `FALLBACK_PREFIX`（「AI 不可用，以下为确定性兜底说明」）
+    """
     import ai_advisor as _ai
 
     text = text or ""
-    if text.startswith(_ai.L1_TEXT_PREFIX):
+    prefix = _ai.FALLBACK_PREFIX if degraded else _ai.L1_TEXT_PREFIX
+    if text.startswith(prefix):
         return text
-    return _ai.L1_TEXT_PREFIX + text
+    # 已带「另一种」前缀也算标注过：不叠两层（那会读成两个来源）
+    if text.startswith(_ai.L1_TEXT_PREFIX) or text.startswith(_ai.FALLBACK_PREFIX):
+        return text
+    return prefix + text
 
 
 def _label_l1(note):
-    """同 `_label_l1_text`，但针对 AdvisorNote（按其 label 取标注）。"""
-    return _label_l1_text(note.draft_text)
+    """针对 AdvisorNote：**按其自身 degraded 取标注**，不无条件贴 AI 前缀。"""
+    degraded = bool(getattr(note, "degraded", False))
+    return _label_l1_text(note.draft_text, degraded=degraded)
 
 
 def _ensure_adv(context):

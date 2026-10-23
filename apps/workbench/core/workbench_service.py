@@ -135,6 +135,26 @@ def optimize_session_label(row):
     return "%s%s" % (head, tail)
 
 
+def _mass_basis_suffix(point):
+    """
+    质量口径的显示后缀（spec：不允许只给一个数不说包含什么）。
+
+    从设计点的评估结果里取 `objective.components`：
+      * 有口径 -> "（含 蒙皮+加筋）"
+      * 无口径 -> "（口径未声明，不可比）"
+    绝不返回空串假装"就是全结构质量"。
+    """
+    ev = point.get("evaluation") or {}
+    obj = ev.get("objective") or {}
+    comps = obj.get("components") or []
+    names = {"skin": "蒙皮", "stiffeners": "加筋"}
+    if comps:
+        return "（含%s）" % "+".join(names.get(c, c) for c in comps)
+    if point.get("objective_value") is not None:
+        return "（口径未声明，不可比）"
+    return ""
+
+
 def optimize_point_label(point):
     """
     设计点一行的文字：「#id · 分组 · 质量 X kg · max_FI / min_MS · 是否最优」。
@@ -151,7 +171,12 @@ def optimize_point_label(point):
                     % (OPTIMIZE_ERROR_KIND_NAMES.get(err.get("kind"),
                                                      err.get("kind") or "?")))
     else:
-        bits.append("质量 %s kg" % _fmt_num(point.get("objective_value")))
+        # 质量**必须带口径**：spec 明确"不允许只给一个数不说包含什么"。
+        # 一个不说明含哪些部件的 kg 数会被误读成全结构质量，进而得出
+        # "减重 30%"这类建立在半个结构上的结论。
+        bits.append("质量 %s kg%s"
+                    % (_fmt_num(point.get("objective_value")),
+                       _mass_basis_suffix(point)))
         bits.append("max_FI %s / min_MS %s"
                     % (_fmt_num(_constraint_value(point, "max_fi")),
                        _fmt_num(_constraint_value(point, "min_ms"))))

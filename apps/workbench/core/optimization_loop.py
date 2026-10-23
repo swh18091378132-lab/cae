@@ -132,9 +132,32 @@ SOURCE_MANUAL = "manual"       # 调用方单独评估一个点
 SOURCE_SURROGATE = "surrogate"
 
 #: 三分组名（与 optimizer.GROUP_NAMES 同一口径，不另造命名）
+#
+# 本模块对外用**名字**（"feasible"/"infeasible"/"failed"），optimizer 内部用
+# **整数** 0/1/2。两套表示共存是有意的：DB 列存名字（可读、可查询、加组不改表），
+# 优化器内部用整数（比较快、与 objectives.sort_key 的 group 位一致）。
+# 但**必须有一个唯一换算处**，否则同一字段两种类型并存 —— 那正是"最优点标记
+# 静默失效"的成因（0 != "feasible" 恒为真）。
 GROUP_FEASIBLE = "feasible"
 GROUP_INFEASIBLE = "infeasible"
 GROUP_FAILED = "failed"
+
+_GROUP_BY_INT = {
+    optimizer.GROUP_FEASIBLE: GROUP_FEASIBLE,
+    optimizer.GROUP_INFEASIBLE: GROUP_INFEASIBLE,
+    optimizer.GROUP_FAILED: GROUP_FAILED,
+}
+_GROUP_TO_INT = dict((v, k) for k, v in _GROUP_BY_INT.items())
+
+
+def group_name_of(group):
+    """整数分组 -> 名字（未知一律归 failed，绝不静默丢点）。"""
+    return _GROUP_BY_INT.get(group, GROUP_FAILED)
+
+
+def _group_of_name(name):
+    """名字 -> 整数分组（与 optimizer.GROUP_* 一致）；未知归 failed。"""
+    return _GROUP_TO_INT.get(name, optimizer.GROUP_FAILED)
 
 # ---------------------------------------------------------------------------
 # 票27：代理模型快筛（可选，默认关闭）
@@ -542,7 +565,11 @@ def _point_from_row(conn, row, best_key=None):
         "vector": _loads(row["vector_json"], {}) or {},
         "vector_key": row["vector_key"],
         "study_id": row["study_id"],
-        "group": optimizer.GROUP_NAMES.get(row["group_name"]),
+        # group 必须是**整数** 0/1/2（与 optimizer.GROUP_* / objectives.sort_key 一致）。
+        # 这里曾误用 GROUP_NAMES.get(...) 取到字符串 "feasible"，于是同一字段在
+        # 循环内部是 int、从库读回是 str —— 任何 `p["group"] == GROUP_FEASIBLE`
+        # 恒为 False（0 != "feasible"），"是否最优点"会静默判错。
+        "group": _group_of_name(row["group_name"]),
         "group_name": row["group_name"],
         "ok": bool(row["ok"]),
         "feasible": (None if row["feasible"] is None else bool(row["feasible"])),
@@ -576,7 +603,7 @@ def _insert_point(conn, session_id, seq, vector, evaluation, study_id,
         "evaluation_json, error_json, source, reused_from, created_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (session_id, int(seq), _dumps(vector), key, study_id,
-         optimizer.GROUP_NAMES.get(group, GROUP_FAILED),
+         group_name_of(group),
          1 if evaluation.get("ok") is True else 0,
          (None if evaluation.get("feasible") is None
           else (1 if evaluation.get("feasible") else 0)),
@@ -1397,6 +1424,18 @@ def record_decision(conn, session_id, decision, role=approval.ROLE_SIGNER,
         raise OptimizationLoopError(
             "会话 %r 还没有任何设计点，无法决策（先跑 run_optimization）"
             % (session_id,), code="no-points")
+
+    # L2 决策是**终态**：一旦定案（采用 / 维持原设计）就不再改。
+    # 这条守卫必须放在核心层，不能只靠服务层拦 —— 否则任何直接调本模块的路径
+    # （脚本、未来 UI、CLI）都能把已签的"采用 A"改成"维持原设计"，
+    # 审计里留下两条互相矛盾的记录，而最终结论取决于谁最后写入。
+    _adoption = session.get("adoption") or {}
+    if _adoption.get("decided"):
+        raise OptimizationLoopError(
+            "会话 %r 的采用决策已定案（%s），不能重复决策"
+            % (session_id,
+               approval.decision_name(_adoption.get("decision"))),
+            code="already-decided")
 
     rec = recommendation_from(points, session)
     target = None
