@@ -15,7 +15,9 @@ data/*.db
 data/*.sqlite
 apps/workbench/data/
 
-# 编辑器/系统
+# 本地 SSH 密钥（绝不入库）
+.ssh-local/
+.known_hosts_local
 .vscode/
 .idea/
 Thumbs.db
