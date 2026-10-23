@@ -67,12 +67,23 @@ PLACEHOLDERS = [
     "mesh_quality.max_aspect",
     "mesh_quality.max_warp",
     "mesh_quality.criteria",
+    # L1 辅助解释（票26，ADR-0002）—— **独立命名空间 adv**，
+    # 与上面的确定性结论（summary/check/model）在数据与版面上都分开。
+    "adv.summary",
+    "adv.suggest",
+    "adv.why",
+    "adv.advisor_id",
+    "adv.degraded_text",
+    "adv.layer_label",
+    "adv.trace",
+    "adv.n_hotspots",
     # 结构化
     "param_table",
     "detail_table",
     "hotspot_table",
     "invalid_bay_table",
     "mesh_quality_table",
+    "adv_table",
     "artifact_table",
     "hotspot_figure",
     "conclusion",
@@ -81,7 +92,10 @@ PLACEHOLDERS = [
 # 标准模板版本。**新增占位符时必须递增**，否则已经存在的
 # data/templates/report_standard.docx（旧版）不会被重建，
 # 新章节就永远不会出现在报告里（用户看到的是老模板）。
-TEMPLATE_VERSION = 2
+#   v1 -> P1 初版
+#   v2 -> P2 增补 分析类型（票14）/ 网格质量（票15）
+#   v3 -> P3 增补 L1 辅助解释章节（票26）
+TEMPLATE_VERSION = 3
 
 # 标记段落：写进 docx 正文，用于识别这份模板是哪一版
 VERSION_MARKER = "模板版本：v%d" % TEMPLATE_VERSION
@@ -263,6 +277,43 @@ def build_standard_template(path):
     # 6 结论
     doc.add_heading("6  结论与建议", level=1)
     doc.add_paragraph("{{conclusion}}")
+
+    # 6.1 L1 辅助解释（票26 / ADR-0002）
+    #
+    # 版面纪律：这一节**排在确定性结论之后**，标题里写明"L1 辅助草稿"，
+    # 且每处都重申"合格与否以第 3 章的 FI/MS 为准"。原因是审核人一旦
+    # 把 AI 文字当成判定依据，ADR-0002 的红线就被越过了 —— 版面本身
+    # 必须让人不可能混淆。
+    doc.add_heading("6.1  L1 辅助解释与建议（AI 生成，人可否决）", level=2)
+
+    p = doc.add_paragraph()
+    run = p.add_run("以下内容为 L1 辅助草稿（AI 生成），仅供参考，人可否决；"
+                    "强度合格判定以第 3 章的确定性 FI/MS 结果为准。")
+    run.italic = True
+
+    p = doc.add_paragraph()
+    p.add_run("解释来源：").bold = True
+    p.add_run("{{adv.advisor_id}}")
+    p.add_run("（").bold = True
+    p.add_run("{{adv.layer_label}}")
+    p.add_run("）    是否降级：")
+    p.add_run("{{adv.degraded_text}}")
+    p.add_run("    覆盖危险部位数：")
+    p.add_run("{{adv.n_hotspots}}")
+
+    doc.add_heading("6.1.1  校核结论解释（L1 辅助草稿）", level=3)
+    doc.add_paragraph("{{adv.summary}}")
+
+    doc.add_heading("6.1.2  危险部位解释与铺层建议（L1 辅助草稿）", level=3)
+    doc.add_paragraph("{{adv.why}}")
+    doc.add_paragraph("{{adv_table}}")
+
+    doc.add_heading("6.1.3  铺层改进建议草案（L1 辅助草稿）", level=3)
+    doc.add_paragraph("{{adv.suggest}}")
+
+    p = doc.add_paragraph()
+    p.add_run("调用留痕（ADR-0002 可解释、可回退、留痕）：").bold = True
+    p.add_run("{{adv.trace}}")
 
     # 附录 可追溯性
     doc.add_heading("附录  产物与指纹（可追溯性）", level=1)

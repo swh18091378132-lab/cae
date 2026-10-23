@@ -34,7 +34,7 @@ _REPORT_OPTIONS = {}
 
 TABLE_PLACEHOLDERS = ("param_table", "detail_table", "hotspot_table",
                       "invalid_bay_table", "artifact_table",
-                      "mesh_quality_table")
+                      "mesh_quality_table", "adv_table")
 IMAGE_PLACEHOLDERS = ("hotspot_figure",)
 
 
@@ -42,11 +42,13 @@ IMAGE_PLACEHOLDERS = ("hotspot_figure",)
 # context 构造
 # ---------------------------------------------------------------------------
 
-def build_report_context(result, generated_at=None):
+def build_report_context(result, generated_at=None, advisor=None):
     """
     从 run_study 的返回 dict 构造报告 context。
 
     result: run_study 返回值（需含 parameters / check / topology 等）
+    advisor: AiAdvisor 适配器（票26）。None/False/不可用都**不抛**——
+             自动降级为确定性兜底文本（degraded=True），报告照常生成。
 
     占位符命名空间（与票 07 约定一致）：
       {{study_id}} {{study_name}} {{template_id}} {{generated_at}}
@@ -57,11 +59,20 @@ def build_report_context(result, generated_at=None):
       结构化：{{param_table}} {{detail_table}} {{hotspot_table}}
              {{invalid_bay_table}} {{artifact_table}} {{hotspot_figure}}
              {{mesh_quality_table}}（票15，P2 增补）
+             {{adv_table}}（票26，L1 辅助）
 
     分析类型与网格质量（P2，票14/票15）：
       {{analysis.kind}} {{analysis.label}} {{analysis.detail}}
       {{mesh_quality.summary}} {{mesh_quality.warnings}}
       {{mesh_quality.n_warn_bays}} {{mesh_quality.n_refined_bays}}
+
+    L1 辅助解释（P3，票26）——**独立命名空间 `adv`**，绝不与确定性字段混放：
+      {{adv.summary}} {{adv.suggest}} {{adv.advisor_id}} {{adv.degraded}}
+      {{adv.layer_label}} {{adv.trace}}
+      以及结构化表 {{adv_table}}（危险部位逐一解释 + 铺层建议）
+
+    ADR-0002：`adv.*` 里的文字是 AI 辅助草稿，人可否决；`summary.*` /
+    `check.*` 的数值与合格判定来自 `strength_check`（L0），**AI 不能改写**。
     """
     chk = result.get("check") or {}
     summ = chk.get("summary") or {}
@@ -177,7 +188,264 @@ def build_report_context(result, generated_at=None):
         "allowables": allow_txt,
         "mesh_quality_summary": mq_text,
     }
+
+    # ---- L1 辅助（票26）-------------------------------------------------
+    # **放在最后**：ctx 里的确定性字段（summary/check/conclusion）此时已经全部
+    # 定稿，adv 的生成过程再怎么样也影响不到它们——这是"AI 不得改写判定"的
+    # 结构性保证，而不是靠约定。
+    adv_ctx, adv_rows = _adv_ctx(result, advisor)
+    ctx["adv"] = adv_ctx
+    ctx["adv_table"] = adv_rows
     return ctx
+
+
+def _adv_ctx(result, advisor=None):
+    """
+    L1 辅助解释上下文（票26）。
+
+    返回 (adv_ctx, adv_rows)：
+      adv_ctx  : 命名空间 dict（summary / suggest / advisor_id / degraded /
+                 layer_label / trace / n_hotspots），供 {{adv.*}} 占位符使用
+      adv_rows : 危险部位逐条解释 + 铺层建议，供 {{adv_table}} 结构化渲染
+
+    ADR-0002 的三条落地要求：
+      1. **不参与判定**：这里只读 result 里已有的确定性数值；
+      2. **不可混淆**：结果放进独立的 `adv` 命名空间，从不写回 summary/check；
+      3. **可降级**：适配器缺失/不可用 -> `resolve_advisor` 给兜底适配器，
+         `degraded=True`，文本换成确定性兜底，报告照常生成。
+      另：传给适配器的只是**深拷贝快照**，适配器即使乱改也污染不到 result。
+    """
+    import copy
+
+    try:
+        from . import ai_advisor as ai_mod
+    except ImportError:  # 允许 report.py 作为脚本直接跑
+        import ai_advisor as ai_mod
+
+    adv = ai_mod.resolve_advisor(advisor)
+    chk = result.get("check") or {}
+    hotspots = chk.get("hotspots") or []
+
+    # 决策：给适配器的是快照，不是活引用（防止适配器回写 result）
+    chk_snapshot = copy.deepcopy(chk)
+
+    # 1) 结论解释
+    try:
+        note_check = adv.explain_check(
+            chk_snapshot, study_name=result.get("study_name"))
+    except Exception as exc:                       # 兜底：绝不让 AI 阻断报告
+        note_check = ai_mod.FallbackAiAdvisor(
+            ai_mod.DEGRADE_ERROR).explain_check(chk_snapshot)
+        note_check.trace["error"] = str(exc)
+
+    # 2) 逐危险部位：解释 + 铺层建议
+    adv_rows = []
+    advises = []
+    detail_best = _hotspot_stress_map(result, chk)
+    for h in hotspots:
+        ctx_h = _hotspot_ctx(result, h, detail_best)
+        try:
+            note_h = adv.explain_hotspot(copy.deepcopy(h), copy.deepcopy(ctx_h))
+            note_s = adv.suggest_layup(copy.deepcopy(h), copy.deepcopy(ctx_h))
+        except Exception as exc:                   # 兜底
+            fb = ai_mod.FallbackAiAdvisor(ai_mod.DEGRADE_ERROR)
+            note_h = fb.explain_hotspot(dict(h), dict(ctx_h))
+            note_s = fb.suggest_layup(dict(h), dict(ctx_h))
+            note_s.trace["error"] = str(exc)
+        adv_rows.append({
+            "elem": h.get("elem"),
+            "sp": h.get("sp"),
+            "criterion": h.get("criterion"),
+            "FI": _fmt(h.get("FI")),
+            "MS": _fmt(h.get("MS")),
+            "bay_id": ctx_h.get("bay_id") or "—",
+            # 两段 AI 文字分列：解释「为什么危险」与「建议怎么改」
+            "why": note_h.draft_text,
+            "suggest": note_s.draft_text,
+            "layer": note_h.layer,
+            "degraded": "是" if (note_h.degraded or note_s.degraded) else "否",
+        })
+        if len(hotspots) <= 3:
+            advises.append(note_s.draft_text)
+
+    degraded = bool(note_check.degraded) or any(
+        r["degraded"] == "是" for r in adv_rows)
+
+    adv_ctx = {
+        # AI 生成的文字（草稿，人可否决）。
+        # **每段文字自带 L1 标注**（_label_l1）：AI 文字一旦脱离上下文被复制到
+        # 别处（邮件、摘要、评审意见），标注仍跟着它——这是 ADR-0002 要求的
+        # "AI 输出必须可识别"，也避免审核人误把它当成确定性结论。
+        "summary": _label_l1(note_check),
+        "suggest": ("\n\n".join(_label_l1_text(t) for t in advises) if advises
+                    else "（危险部位过多，逐条建议见第 6.1.2 节 AI 辅助表）"),
+        "why": "\n\n".join(_label_l1_text(r["why"]) for r in adv_rows),
+        # 来源与状态（必须显式呈现给审核人）：
+        #   degraded 是**布尔**（程序判断用），degraded_text 是中文（报告显示用）
+        "advisor_id": note_check.advisor_id,
+        "degraded": degraded,
+        "degraded_text": "是" if degraded else "否",
+        "layer": note_check.layer,
+        "layer_label": note_check.label,
+        "n_hotspots": len(adv_rows),
+        # 留痕：适配器 + 输入摘要（ADR-0002「可解释、可回退、留痕」）
+        "trace": _trace_text(note_check.trace, adv_rows),
+        "trace_dict": dict(note_check.trace or {}),
+    }
+    return adv_ctx, adv_rows
+
+
+def _label_l1_text(text):
+    """给一段 AI 文字加上 L1 标注前缀（幂等：已带标注则不重复加）。"""
+    import ai_advisor as _ai
+
+    text = text or ""
+    if text.startswith(_ai.L1_TEXT_PREFIX):
+        return text
+    return _ai.L1_TEXT_PREFIX + text
+
+
+def _label_l1(note):
+    """同 `_label_l1_text`，但针对 AdvisorNote（按其 label 取标注）。"""
+    return _label_l1_text(note.draft_text)
+
+
+def _ensure_adv(context):
+    """
+    保证 context 里有完整的 `adv` 命名空间（票26）。
+
+    为什么需要：模板从 v3 起含 `{{adv.*}}` 占位符，而手工构造 context 的调用方
+    （单测、外部脚本、旧版服务层）不会带这组键。缺了它，渲染器会把占位符
+    **原样保留**并计入 unresolved ——AI 章节在报告里变成一堆 `{{adv.summary}}`，
+    比没有还糟。这里补的是确定性兜底内容（degraded=True），既不臆造 AI 输出，
+    也不让报告出现空洞。
+
+    已完整提供 adv 的 context 原样返回（只补缺失的键，不覆盖调用方的值）。
+    """
+    try:
+        import ai_advisor as _ai
+    except ImportError:  # pragma: no cover
+        return context
+
+    ctx = dict(context or {})
+    adv = ctx.get("adv")
+    if not isinstance(adv, dict) or "summary" not in adv:
+        fb = _ai.FallbackAiAdvisor(_ai.DEGRADE_MISSING)
+        note = fb.explain_check(ctx.get("check") or {})
+        adv = {
+            "summary": _label_l1(note),
+            "suggest": "（本次未启用 AI 铺层建议，请以确定性校核结果为准）",
+            "why": "",
+            "advisor_id": note.advisor_id,
+            "degraded": True,
+            "degraded_text": "是",
+            "layer": note.layer,
+            "layer_label": note.label,
+            "n_hotspots": len((ctx.get("check") or {}).get("hotspots") or []),
+            "trace": _trace_text(note.trace, []),
+            "trace_dict": dict(note.trace or {}),
+        }
+    else:
+        adv = dict(adv)
+        defaults = {
+            "degraded_text": ("是" if adv.get("degraded") else "否"),
+            "layer": _ai.LAYER_L1,
+            "layer_label": (_ai.LAYER_L1_LABEL if not adv.get("degraded")
+                            else "L1 辅助（AI 不可用，确定性兜底）"),
+            "n_hotspots": len((ctx.get("check") or {}).get("hotspots") or []),
+            "trace": "",
+        }
+        for key, val in defaults.items():
+            if key not in adv:
+                adv[key] = val
+    ctx["adv"] = adv
+    if "adv_table" not in ctx:
+        ctx["adv_table"] = []
+    return ctx
+
+
+def _trace_text(trace, adv_rows):
+    """把留痕渲染成一行可读文本（报告附录/UI 都能直接显示）。"""
+    t = trace or {}
+    parts = ["适配器=%s" % (t.get("advisor_id") or "—"),
+             "方法=%s" % (t.get("method") or "—"),
+             "输入摘要=%s" % (t.get("input_digest") or "—"),
+             "降级=%s" % ("是" if t.get("degraded") else "否"),
+             "覆盖危险部位=%d" % len(adv_rows)]
+    if t.get("degrade_reason"):
+        parts.append("降级原因=%s" % t["degrade_reason"])
+    return "；".join(parts)
+
+
+def _hotspot_stress_map(result, check):
+    """
+    从抽取结果里取危险部位的应力分量（供 L1 解释"为什么这里危险"）。
+
+    票26 要求 explain_hotspot "基于该处 FI/MS、铺层、自然格归属"；
+    应力分量是 strength_check 的**输入**（已由确定性抽取得到），L1 只读不重算。
+    取不到时返回空 dict，说明文字会自行降级为"上下文缺失"。
+    """
+    stress_map = (result.get("stress_map") or {})
+    if not stress_map:
+        return {}
+    out = {}
+    for h in (check.get("hotspots") or []):
+        key = (h.get("elem"), h.get("sp"))
+        comps = stress_map.get(key) or stress_map.get("%s|%s" % key)
+        if comps:
+            out[key] = comps
+    return out
+
+
+def _hotspot_ctx(result, hotspot, stress_by_elemsp=None):
+    """
+    单个危险部位的解释上下文：自然格归属 + 铺层 + 应力分量。
+
+    自然格归属从 `result['fe_model'].mesh.elems` 里查（每单元唯一归属一个
+    自然格，ADR-0010）——不靠猜，也不在这里重算任何力学量。
+    应力分量来自确定性抽取结果（strength_check 的输入），L1 只读不重算。
+    """
+    elem = hotspot.get("elem")
+    bay_id = None
+
+    fe_model = result.get("fe_model")
+    mesh = getattr(fe_model, "mesh", None)
+    if mesh is not None:
+        for e in getattr(mesh, "elems", []) or []:
+            if e.get("id") == elem:
+                bay_id = e.get("bay_id")
+                break
+
+    # 铺层：优先用 FE 模型的 laminate（真实铺层），退回 result['fe']
+    lam = getattr(fe_model, "laminate", None) or {}
+    fe = result.get("fe") or {}
+    plies = lam.get("plies")
+    if plies is None:
+        plies = result.get("plies")
+    n_plies = lam.get("n_plies", fe.get("n_plies"))
+    total_thk = lam.get("total_thickness", fe.get("total_thickness"))
+
+    # 应力分量：先按 (elem, sp) 精确匹配，再退回该单元任意铺层（同为确定性输入）
+    comps = {}
+    lookup = stress_by_elemsp or {}
+    key = (elem, hotspot.get("sp"))
+    comps = lookup.get(key) or {}
+    if not comps and elem is not None:
+        for (e, _sp), c in lookup.items():
+            if e == elem:
+                comps = c
+                break
+
+    return {
+        "bay_id": bay_id,
+        "plies": plies,
+        "n_plies": n_plies,
+        "total_thickness": total_thk,
+        "stress": {"s11": comps.get("c1"), "s22": comps.get("c2"),
+                   "s12": comps.get("c4")},
+        "allowables": ((result.get("check") or {}).get("summary") or {}).get(
+            "allowables"),
+    }
 
 
 def _analysis_ctx(result):
@@ -390,6 +658,11 @@ def render_report(*args, **kwargs):
     if not os.path.isfile(template_path):
         raise FileNotFoundError("报告模板不存在: %s" % template_path)
 
+    # 模板当前版本含 {{adv.*}}（票26）。手工构造 context 的调用方（测试、
+    # 外部脚本、旧版服务层）不会带这组键——渲染器在这里补上确定性兜底，
+    # 否则那些占位符会被保留原样并计入 unresolved，等于把 AI 章节变成噪音。
+    context = _ensure_adv(context)
+
     doc = Document(template_path)
     warnings = []
     replaced = 0
@@ -478,12 +751,29 @@ def _clear_para(para):
 
 
 def _set_para_text(para, text):
+    """
+    整段替换文本，并把 ``\\n`` 渲染成真正的换行（Word 的 <w:br/>）。
+
+    AI 解释是**多行**文本（分段说明），若把整段塞进一个 run，换行会丢失、
+    所有句子挤成一坨，审核人无法区分"结论/解释/建议"三段——那正好违背
+    "L1 辅助须清晰可读"的初衷。
+    """
     _clear_para(para)
-    run = para.add_run(text)
     try:
+        run = para.add_run()
         run.font.size = Pt(10.5)
     except Exception:
-        pass
+        para.add_run()
+        run = para.runs[0]
+        try:
+            run.font.size = Pt(10.5)
+        except Exception:
+            pass
+    lines = str(text).split("\n")
+    for i, line in enumerate(lines):
+        if i:
+            run.add_break()
+        run.add_text(line)
 
 
 def _insert_table_at(doc, para, key, data, warnings):
@@ -544,6 +834,23 @@ def _insert_table_at(doc, para, key, data, warnings):
                          str(r.get("subdiv"))))
         if len(rows) == 1:
             rows.append(("（无）", "全部自然格达标", "—", "—", "—", "—"))
+    elif key == "adv_table":
+        # L1 辅助解释表（票26）：危险部位逐条解释 + 铺层建议。
+        # 表头刻意带上"L1 辅助"，让审核人一眼看出这不是确定性结论。
+        rows = [("危险部位", "自然格", "FI", "MS", "为什么这里危险（L1 辅助草稿）",
+                 "铺层改进建议（L1 辅助草稿）", "降级")]
+        for r in (data or []):
+            rows.append((
+                "单元 %s / 第 %s 铺层 / %s"
+                % (r.get("elem"), r.get("sp"), r.get("criterion")),
+                str(r.get("bay_id")),
+                str(r.get("FI")), str(r.get("MS")),
+                str(r.get("why") or ""),
+                str(r.get("suggest") or ""),
+                str(r.get("degraded") or "否")))
+        if len(rows) == 1:
+            rows.append(("（无危险部位）", "—", "—", "—",
+                         "本次校核未产生危险部位条目", "—", "—"))
     else:
         return
 
