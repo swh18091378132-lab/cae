@@ -101,6 +101,30 @@ GATE_SIGN = "approval_sign"        # 签发
 
 AUDIT_GATES = (GATE_SUBMIT, GATE_RERUN, GATE_REVIEW, GATE_SIGN)
 
+# ---------------------------------------------------------------------------
+# 票25（P3）：优化方案采用的 L2 审计 gate
+#
+# 优化闭环结束只给「建议采用的设计点」（ADR-0002：优化器是 L0，只能建议）。
+# 采用与否是人（签发角色）的决定，因此这是**又一个 L2 gate**，不是新状态机：
+#   - 报告状态机（TRANSITIONS / _ACTION_RULES / ROLE_QUEUES）**一行不改**，
+#     P2 的审批行为零回归；
+#   - 这里只新增常量 + 一个薄函数（写一条 decisions 审计），
+#     优化会话的采用状态由 optimization_loop 自己的表承载。
+# ---------------------------------------------------------------------------
+
+GATE_OPTIMIZE_DECISION = "approval_optimize_decision"
+
+#: 优化采用的两种合法决策
+DECISION_ADOPT = "adopt"                     # 采用某个优化设计点
+DECISION_KEEP_ORIGINAL = "keep_original"     # 维持原设计（也是合法且必须留痕的决定）
+
+OPTIMIZE_DECISIONS = (DECISION_ADOPT, DECISION_KEEP_ORIGINAL)
+
+DECISION_NAMES = {
+    DECISION_ADOPT: "采用优化方案",
+    DECISION_KEEP_ORIGINAL: "维持原设计",
+}
+
 # 动作 -> (需要哪个角色, 中文动作名)
 _ACTION_RULES = {
     GATE_REVIEW: (ROLE_REVIEWER, "审核"),
@@ -620,3 +644,106 @@ def is_signed(conn, study_id, version=None):
     """该版本是否已签发（最终版）。未登记时返回 False。"""
     row = _fetch(conn, study_id, version)
     return bool(row is not None and is_final(row["status"]))
+
+
+# ---------------------------------------------------------------------------
+# 票25：优化方案采用决策的 L2 审计（薄函数，不动报告状态机）
+# ---------------------------------------------------------------------------
+
+def decision_name(decision):
+    """优化采用决策的中文名（日志/报告共用）。"""
+    return DECISION_NAMES.get(decision, decision)
+
+
+def record_optimize_decision(conn, study_id, decision, role=ROLE_SIGNER,
+                             operator=None, rationale=None, session_id=None,
+                             point_id=None):
+    """
+    把"采用优化方案 / 维持原设计"这个 L2 决定写进 decisions 审计表。
+
+    **只写审计，不改报告状态机**：报告审批（analyzing → pending_review →
+    approved/rejected → signed）的转换表与既有 gate 语义完全不受影响，
+    因为"采用哪个优化设计点"与"这一版报告能不能签发"是两件事。
+    优化会话自己的采用状态由 `optimization_loop` 的表承载，本函数只管留痕。
+
+    采用决策是 L2，所以默认要求「签发」角色（`ROLE_SIGNER`）——
+    与报告签发同级的权力，不能由优化器或分析角色自行决定。
+
+    study_id   : 审计挂靠的 Study（decisions.study_id 有外键，必须存在）
+    decision   : `OPTIMIZE_DECISIONS` 之一
+    session_id : 优化会话 id（写进理由，便于按会话检索）
+    point_id   : 被采用的设计点 id（维持原设计时可为 None）
+
+    返回写入的审计 dict。
+    """
+    if decision not in OPTIMIZE_DECISIONS:
+        raise ApprovalError(
+            "未知的优化采用决策 %r（合法值：%s）"
+            % (decision, ", ".join(OPTIMIZE_DECISIONS)),
+            code="invalid-decision")
+    if role not in ROLES:
+        raise ApprovalError("未知角色 %r（合法值：%s）"
+                            % (role, ", ".join(ROLES)), code="invalid-role")
+    if role != ROLE_SIGNER:
+        raise ApprovalError(
+            "角色「%s」无权决定是否采用优化方案（需要「%s」角色）"
+            % (role_name(role), role_name(ROLE_SIGNER)), code="invalid-role")
+
+    row = conn.execute("SELECT id FROM studies WHERE id=?",
+                       (study_id,)).fetchone()
+    if row is None:
+        raise ApprovalError("优化决策的审计必须挂在一个存在的 Study 上：%r 不存在"
+                            % (study_id,), code="invalid-study")
+
+    parts = []
+    if session_id:
+        parts.append("优化会话 %s" % session_id)
+    if point_id is not None:
+        parts.append("设计点 #%s" % point_id)
+    text = rationale or decision_name(decision)
+    if parts:
+        text = "（%s）%s" % ("，".join(parts), text)
+
+    study_mod.add_decision(study_id, GATE_OPTIMIZE_DECISION,
+                           _actor_text(role, operator), decision, text,
+                           conn=conn)
+    return {
+        "study_id": study_id,
+        "gate": GATE_OPTIMIZE_DECISION,
+        "decision": decision,
+        "decision_name": decision_name(decision),
+        "role": role,
+        "actor": _actor_text(role, operator),
+        "session_id": session_id,
+        "point_id": point_id,
+        "rationale": text,
+    }
+
+
+def optimize_decisions(conn, study_id=None, session_id=None):
+    """
+    查询优化采用决策的审计记录（可按 Study / 会话过滤，按时间升序）。
+
+    复用 decisions 表（P1 既有），不新建表；gate 以 `approval_optimize` 前缀
+    命名，因此 `history()` 的 `gate LIKE 'approval%'` 也会一并看到它们 ——
+    一个 Study 的审批链与优化采用决定在同一条审计时间线上，可交叉核对。
+    """
+    sql = ("SELECT * FROM decisions WHERE gate=? "
+           "ORDER BY id")
+    args = [GATE_OPTIMIZE_DECISION]
+    if study_id is not None:
+        sql = ("SELECT * FROM decisions WHERE gate=? AND study_id=? ORDER BY id")
+        args.append(study_id)
+    rows = conn.execute(sql, tuple(args)).fetchall()
+    out = []
+    for r in rows:
+        if session_id is not None:
+            if session_id not in (r["rationale"] or ""):
+                continue
+        out.append({"study_id": r["study_id"], "gate": r["gate"],
+                    "actor": r["actor"], "decision": r["decision"],
+                    "decision_name": decision_name(r["decision"]),
+                    "rationale": r["rationale"],
+                    "created_at": r["created_at"]})
+    return out
+
