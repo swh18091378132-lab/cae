@@ -7,7 +7,8 @@ run_study.py -- Study 编排器（唯一主测试切口）
   M2(票03)：数模 -> 结构拓扑模型 -> 自然格 + 不连续格 -> 血缘
   M3(票04)：拓扑 -> 网格(与自然格对齐) -> 铺层(CAE 属性)+载荷/BC -> .inp -> 血缘
   M4(票05)：.inp -> Abaqus 求解(.odb) -> ODB 抽取(CSV/JSON+manifest) -> 血缘
-后续票 06-07 将在此继续接入 校核/报告，接口保持向后兼容。
+  M5(票06)：抽取 + 规则 -> 单元x铺层x准则 FI/MS -> 自然格聚合 -> 危险部位 -> 血缘
+后续票 07 将在此继续接入 报告生成，接口保持向后兼容。
 
 兼容 Python 3.8。
 """
@@ -18,11 +19,13 @@ try:
     from . import template_registry
     from . import topology
     from . import fe_model
+    from . import strength_check
     from .study import add_artifact, link
 except ImportError:
     import template_registry
     import topology
     import fe_model
+    import strength_check
     from study import add_artifact, link
 
 
@@ -36,7 +39,8 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
               with_topology=True, with_fe_model=False, fe_dir=None,
               subdiv_per_bay=4, plies=None, material=None,
               step=None, load=None,
-              abaqus=None, with_solve=False, job_name="job1", solve_dir=None):
+              abaqus=None, with_solve=False, job_name="job1", solve_dir=None,
+              with_check=False, rules=None, rules_path=None, check_dir=None):
     """
     执行一次 Study。返回 dict 汇总。
 
@@ -212,6 +216,68 @@ def run_study(study_id, parameter_set, template_id, catia, conn,
             "csv_path": ext.csv_path,
             "manifest_path": ext.manifest_path,
             "manifest": ext.manifest,
+        }
+
+    # 7) 强度校核（票 06）
+    if with_check:
+        if not with_solve:
+            raise StudyRunError("强度校核需要先启用 with_solve")
+
+        try:
+            rule_set = strength_check.load_rules(rules_path, rules)
+        except Exception as exc:
+            raise StudyRunError("校核规则无效: %s" % exc)
+
+        cdir = check_dir or (os.path.join(params_dir, "check") if params_dir else "check")
+        if not os.path.isdir(cdir):
+            os.makedirs(cdir)
+
+        # 规则本身作为一个版本化产物（改规则 = 新版本）
+        rules_uri = os.path.join(cdir, "rules.json")
+        import json as _json
+        with open(rules_uri, "w", encoding="utf-8") as fh:
+            _json.dump(rule_set, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        rule_id = add_artifact(
+            study_id, "check_rule", content_uri=rules_uri,
+            params={"criteria": rule_set["criteria"],
+                    "safety_factor": rule_set["safety_factor"],
+                    "rules_checksum": strength_check.rules_checksum(rule_set)},
+            conn=conn)
+
+        # 单元 -> 自然格 归属（来自网格：单元按格划分，故可直接推）
+        bay_of_elem = {}
+        try:
+            mesh = result["fe_model"].mesh
+            for e in mesh.elems:
+                bay_of_elem[e["id"]] = e["bay_id"]
+        except Exception:
+            bay_of_elem = None
+
+        stress = strength_check.read_extraction(result["extraction"]["csv_path"], rule_set)
+        chk = strength_check.check(stress, rule_set, model, bay_of_elem)
+        csv_out, json_out = strength_check.write_outputs(chk, cdir)
+
+        res_id = add_artifact(
+            study_id, "check_result", content_uri=json_out,
+            params={"n_detail_rows": chk["summary"]["n_detail_rows"],
+                    "n_elems": chk["summary"]["n_elems"],
+                    "n_bays_checked": chk["summary"]["n_bays_checked"],
+                    "n_bays_excluded": chk["summary"]["n_bays_excluded"],
+                    "max_fi": chk["summary"]["max_fi"],
+                    "min_ms": chk["summary"]["min_ms"],
+                    "all_pass": chk["summary"]["all_pass"]},
+            conn=conn)
+        link(result["artifacts"]["extraction"], res_id, conn=conn)
+        link(rule_id, res_id, conn=conn)
+
+        result["artifacts"]["check_rule"] = rule_id
+        result["artifacts"]["check_result"] = res_id
+        result["check"] = {
+            "detail_csv": csv_out,
+            "summary_json": json_out,
+            "summary": chk["summary"],
+            "hotspots": chk["hotspots"],
+            "invalid_bays": chk["invalid_bays"],
         }
 
     return result
