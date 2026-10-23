@@ -21,6 +21,7 @@ try:
     from . import run_study as rs_mod
     from . import report_template
     from . import approval
+    from . import model_rollup as rollup_mod
     from .catia_driver import FakeCatiaDriver, RealCatiaDriver
     from .abaqus_runner import FakeAbaqusRunner, RealAbaqusRunner
 except ImportError:
@@ -30,6 +31,7 @@ except ImportError:
     import run_study as rs_mod
     import report_template
     import approval
+    import model_rollup as rollup_mod
     from catia_driver import FakeCatiaDriver, RealCatiaDriver
     from abaqus_runner import FakeAbaqusRunner, RealAbaqusRunner
 
@@ -352,4 +354,48 @@ class WorkbenchService(object):
             return fn(self.conn, study_id, version, **kwargs)
         except approval.ApprovalError as exc:
             raise ServiceError(str(exc))
+
+    # ---------------- 型号级汇总视图（票17） ----------------
+    #
+    # 与审批流同样只做**薄封装**：批量编排与结论汇总的算法在 core/model_rollup.py
+    # （纯 Python 可单测），UI（票19）只调这里。
+    #
+    # mode="real" 时批量运行走真机适配器；mode="fake" 时走 fake 适配器，
+    # 于是"一键跑通全部部件"在测试机上也能确定性回归。
+
+    def run_model_batch(self, model_id, **kwargs):
+        """
+        在型号配置下**一键跑通多个部件**（逐部件完整链：建模→拓扑→FE→求解→
+        抽取→校核→报告），单部件失败不影响其他部件。
+
+        返回 model_rollup.run_model_batch 的结果 dict（含逐部件结果 + 型号级汇总）。
+        额外关键字参数原样透传（parts / options / part_options /
+        params_overrides / stop_on_error）。
+        """
+        try:
+            return rollup_mod.run_model_batch(self.conn, model_id,
+                                              service=self, **kwargs)
+        except Exception as exc:
+            raise ServiceError(str(exc))
+
+    def get_model_rollup(self, model_id):
+        """
+        取型号级汇总视图：每部件的最大 FI / 最小 MS / 合格判定 / 流程状态 /
+        失败原因（结论取各部件**最新版本**的校核结果）。失败抛 ServiceError。
+        """
+        try:
+            return rollup_mod.rollup(self.conn, model_id)
+        except Exception as exc:
+            raise ServiceError(str(exc))
+
+    def get_part_rollup(self, model_id, part_key):
+        """取型号配置下某个部件的汇总行（UI 局部刷新用）；无该部件返回 None。"""
+        try:
+            return rollup_mod.get_part_rollup(self.conn, model_id, part_key)
+        except Exception as exc:
+            raise ServiceError(str(exc))
+
+    def format_model_rollup(self, model_id):
+        """把型号级汇总渲染成可读文本（CLI / 日志 / UI 列表共用）。"""
+        return rollup_mod.format_rollup_text(self.get_model_rollup(model_id))
 
